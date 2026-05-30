@@ -24,6 +24,7 @@ local sState             -- "idle" | "busy" (strict one-in-flight)
 local sBusySocket        -- the connection socket currently holding the busy token
 local sConn              -- per-connection scratch: sConn[socket]["token"|"method"|"path"|"contentLength"]
 local sPaused            -- master "pause edits" switch (panel/tool); blocks mutations when true
+local sKeepAliveID       -- pending keepAlive message id, so we can cancel it cleanly
 
 
 -- ============================================================ lifecycle
@@ -73,7 +74,7 @@ command hxtBridgeStart
          return "handshake write failed:" && tHsErr
       end if
       hxtLog "ready: handshake at" && hxtHandshakePath()
-      send "hxtKeepAlive" to me in 30 seconds   -- keep this (invisible) stack resident, not purged
+      hxtScheduleKeepAlive   -- keep this (invisible) stack resident, not purged
       return empty
    catch tException
       hxtLog "EXCEPTION in hxtBridgeStart:" && tException
@@ -82,6 +83,10 @@ command hxtBridgeStart
 end hxtBridgeStart
 
 command hxtBridgeStop
+   if sKeepAliveID is not empty then
+      cancel sKeepAliveID
+      put empty into sKeepAliveID
+   end if
    if sListenPort is not empty then
       if sListenPort is among the lines of the openSockets then close socket sListenPort
    end if
@@ -106,8 +111,14 @@ end hxtBridgeStatus
 -- and logs listener liveness each cycle for diagnosis.
 on hxtKeepAlive
    if sListenPort is empty then exit hxtKeepAlive   -- bridge stopped; let the timer lapse
-   send "hxtKeepAlive" to me in 30 seconds
+   hxtScheduleKeepAlive
 end hxtKeepAlive
+
+private command hxtScheduleKeepAlive
+   if sKeepAliveID is not empty then cancel sKeepAliveID   -- avoid duplicate timer loops
+   send "hxtKeepAlive" to me in 30 seconds
+   put the result into sKeepAliveID
+end hxtScheduleKeepAlive
 
 
 -- ============================================================ logging
@@ -446,7 +457,7 @@ end hxtOpSetPaused
 -- coarse guard for "user is interacting". Executing-script and compiled-library are handled at the
 -- mutation site (try/catch + read-back verify) since neither is queryable up front.
 private function hxtSafeToEdit pComp, pOperation
-   if sPaused then return "paused"
+   if sPaused is true then return "paused"   -- `is true` so an uninitialized empty doesn't throw
 
    local tName, tCardId, tObjId, tKind
    put pComp["stack"] into tName
@@ -633,7 +644,12 @@ private function hxtResolveComp pHandle
          put (there is a card id tCardId of stack tName) into tExists
          break
       default
-         put (there is a control id tObjId of card id tCardId of stack tName) into tExists
+         -- guard the parent card too: the card may have been deleted since the handle was minted
+         if there is a card id tCardId of stack tName then
+            put (there is a control id tObjId of card id tCardId of stack tName) into tExists
+         else
+            put false into tExists
+         end if
    end switch
    if not tExists then put "stale_handle" into tComp["error"]
    return tComp
