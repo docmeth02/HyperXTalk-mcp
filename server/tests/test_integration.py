@@ -26,7 +26,7 @@ def test_large_body_echo_real_bridge():
     # Content-Length reader and JSON escaping round-trip with no truncation. NOTE: the bridge's
     # current string handling is O(n^2), so payloads >~0.5 MB get slow (correct, just slow) — a
     # tracked follow-up. MCP script payloads are far smaller than this.
-    payload = "线 quote=\" newline\n tab\t backslash\\ " * 6_500  # ~250 KB, multibyte + escapes
+    payload = '线 quote=" newline\n tab\t backslash\\ ' * 6_500  # ~250 KB, multibyte + escapes
     assert len(payload) > 200_000
     result = BridgeClient(timeout=30).call("echo", {"data": payload})
     assert result["data"] == payload
@@ -107,8 +107,12 @@ def test_edit_roundtrip_real_bridge():
     try:
         made = c.call(
             "control.create",
-            {"parentHandle": card_handle, "type": "button", "name": "MCP Test Button",
-             "props": {"width": 120}},
+            {
+                "parentHandle": card_handle,
+                "type": "button",
+                "name": "MCP Test Button",
+                "props": {"width": 120},
+            },
         )
         assert made.get("type") == "button" and made.get("id") and made.get("handle")
         h = made["handle"]
@@ -148,6 +152,49 @@ def test_edit_roundtrip_real_bridge():
         with pytest.raises(BridgeError) as de:
             c.call("object.getProps", {"handle": handle})
         assert de.value.kind == "stale_handle"
+
+
+@_skip
+def test_handle_survives_sibling_create_real_bridge():
+    """Regression: a handle minted BEFORE a control-create must still resolve AFTER it.
+
+    A stack's `the id` is its per-stack id counter (bumped by every newid() on control creation),
+    so the resolver must NOT key on it. Before the fix, creating any control invalidated every
+    outstanding handle for that stack (spurious stale_handle).
+    """
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=20)
+    stacks = _as_list(c.call("stacks.list").get("stacks"))
+    if not stacks:
+        pytest.skip("no user stacks open in HyperXTalk")
+    # card_handle is minted now, before any creation below
+    card_handle = _as_list(c.call("tree.get", {"handle": stacks[0]["handle"]}).get("cards"))[0][
+        "handle"
+    ]
+
+    created = []
+    try:
+        a = c.call(
+            "control.create",
+            {"parentHandle": card_handle, "type": "button", "name": "MCP Sibling A"},
+        )
+        created.append(a["handle"])
+        # the create above bumped the stack's id counter; the SAME pre-create handle must still work
+        b = c.call(
+            "control.create",
+            {"parentHandle": card_handle, "type": "button", "name": "MCP Sibling B"},
+        )
+        created.append(b["handle"])
+        # and a read through the stale-prone stack handle still resolves
+        assert _as_list(c.call("tree.get", {"handle": stacks[0]["handle"]}).get("cards"))
+    finally:
+        for handle in created:
+            try:
+                c.call("object.delete", {"handle": handle})
+            except BridgeError:
+                pass
 
 
 @_skip

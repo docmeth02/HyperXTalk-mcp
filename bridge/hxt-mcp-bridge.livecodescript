@@ -1119,12 +1119,18 @@ private function hxtResolveComp pHandle
       return tComp
    end if
 
-   local tName
-   put hxtFindOpenStack(tH["stack"]) into tName
-   if tName is empty then
+   local tName, tMatches
+   put hxtFindOpenStack(tH["stack"]) into tMatches
+   if tMatches is empty then
       put "stale_handle" into tComp["error"]
       return tComp
    end if
+   if the number of lines of tMatches > 1 then
+      -- two open stacks share the same stable identity; never guess which one.
+      put "ambiguous_handle" into tComp["error"]
+      return tComp
+   end if
+   put line 1 of tMatches into tName
    put tName into tComp["stack"]
    put tH["cardId"] into tComp["cardId"]
    put tH["objId"] into tComp["objId"]
@@ -1152,16 +1158,39 @@ private function hxtResolveComp pHandle
    return tComp
 end hxtResolveComp
 
--- Fail-closed: only ever returns the name of an already-open stack whose id matches.
--- Never references stack "name" speculatively (that can side-effect-load by filename).
+-- Fail-closed: return the open-stack name(s) whose STABLE identity matches the handle's stack key.
+-- Stable identity = effective filename + mainStackName for SAVED stacks, else mainStackName + short
+-- name for unsaved ones. We deliberately do NOT use `the id of stack`: a stack's id is its per-stack
+-- id COUNTER (MCStack::newid -> ++obj_id, stack3.cpp:1481), pre-incremented by every control creation
+-- (object.cpp:367), so it is a mutation counter, not an identity. Iterating `the openStacks` keeps
+-- this fail-closed; we never reference stack "name" speculatively (can side-effect-load a file,
+-- dispatch.cpp:2054). Returns newline-delimited matches; caller treats >1 as ambiguous, 0 as stale.
 private function hxtFindOpenStack pStackKey
-   local tName
+   local tName, tMatches, tWantFile, tWantMain, tWantShort, tHit
+   put pStackKey["fileName"] into tWantFile
+   put pStackKey["mainStackName"] into tWantMain
+   put pStackKey["shortName"] into tWantShort
    repeat for each line tName in the openStacks
-      if tName is pStackKey["shortName"] then
-         if (the id of stack tName) is pStackKey["stackId"] then return tName
+      put false into tHit
+      if the mainStack of stack tName is tWantMain then
+         if tWantFile is not empty then
+            -- saved stack: the file path is the strongest stable key
+            -- (block form, not single-line: a single-line `if..then` right before `else`
+            --  binds the else to the inner if -> dangling-else, corrupts block nesting)
+            if the effective filename of stack tName is tWantFile then
+               put true into tHit
+            end if
+         else
+            -- unsaved stack: no file yet, fall back to the short name
+            if the effective filename of stack tName is empty then
+               if the short name of stack tName is tWantShort then put true into tHit
+            end if
+         end if
       end if
+      if tHit then put tName & linefeed after tMatches
    end repeat
-   return empty
+   if tMatches is not empty then delete the last char of tMatches
+   return tMatches
 end hxtFindOpenStack
 
 

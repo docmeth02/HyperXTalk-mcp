@@ -14,6 +14,7 @@ ERROR_KINDS = frozenset(
         "notfound",  # op or object does not exist
         "badarg",  # malformed/invalid params
         "stale_handle",  # handle no longer resolves; re-discover
+        "ambiguous_handle",  # >1 open stack shares the handle's identity; never guess
         "not_safe_to_edit",  # mutation rejected by the safe-to-edit gate / pause
         "busy",  # another request is in flight (one-in-flight)
         "unauthorized",  # missing/invalid token
