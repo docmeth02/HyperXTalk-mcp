@@ -337,6 +337,42 @@ def test_run_set_mode_real_bridge():
 
 
 @_skip
+def test_handler_edit_roundtrip_real_bridge():
+    """Phase 8a: set a 2-handler script, replace one handler, verify the sibling is preserved."""
+    from hyperxtalk_mcp import script_handlers as sh
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=20)
+    st = c.call("stack.create", {"name": "MCP Handler Test"})
+    try:
+        card = _as_list(c.call("tree.get", {"handle": st["handle"]}).get("cards"))[0]["handle"]
+        btn = c.call("control.create", {"parentHandle": card, "type": "button", "name": "b"})[
+            "handle"
+        ]
+        original = (
+            "on mouseUp\n   beep\nend mouseUp\n\non mouseDown\n   pass mouseDown\nend mouseDown"
+        )
+        c.call("object.setScript", {"handle": btn, "script": original})
+
+        script = c.call("object.getScript", {"handle": btn})["script"]
+        assert [h.name for h in sh.parse_handlers(script)] == ["mouseUp", "mouseDown"]
+
+        edited = sh.replace_or_append_handler(
+            script, "mouseUp", 'on mouseUp\n   answer "changed"\nend mouseUp'
+        )
+        c.call("object.setScript", {"handle": btn, "script": edited})
+        back = c.call("object.getScript", {"handle": btn})["script"]
+        assert "answer" in back and "beep" not in back  # target replaced
+        assert "mouseDown" in back  # sibling preserved
+    finally:
+        try:
+            c.call("stack.delete", {"handle": st["handle"]})
+        except BridgeError:
+            pass
+
+
+@_skip
 def test_concurrent_request_gets_busy():
     """While one request holds the bridge busy (via __busytest), a second must get 409 busy."""
     import threading

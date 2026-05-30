@@ -6,8 +6,11 @@ in phase 4; …).
 
 from __future__ import annotations
 
+import re
+
 from fastmcp import FastMCP
 
+from . import dictionary, script_handlers
 from .bridge_client import BridgeClient, BridgeUnavailable
 from .errors import BridgeError
 
@@ -275,6 +278,140 @@ def set_run_mode(mode: str) -> dict:
     (clicking selects/moves controls). This is an IDE-global setting, not per-stack.
     """
     return _call("run.setMode", {"mode": mode})
+
+
+# --- agent ergonomics: dictionary (phase 8a) ----------------------------------------------------
+
+
+@mcp.tool
+def search_dictionary(query: str, limit: int = 20) -> dict:
+    """Search the xTalk language dictionary by keyword (matches term names first, then summaries).
+
+    Returns up to `limit` compact matches (name, type, summary, first syntax form). Use
+    lookup_dictionary for the full entry once you know the exact term name.
+    """
+    if dictionary.dictionary_root() is None:
+        return {
+            "error": "dictionary not found; set HXT_DICTIONARY_PATH to a docs/dictionary folder"
+        }
+    return {"results": dictionary.search(query, limit)}
+
+
+@mcp.tool
+def lookup_dictionary(term: str) -> dict:
+    """Look up the exact xTalk dictionary entry for `term` (a command, function, property, etc.).
+
+    Returns name, type, syntax form(s), summary, parameters, and examples — the authoritative
+    reference for writing correct xTalk. A term may have more than one entry (e.g. property + tool).
+    """
+    if dictionary.dictionary_root() is None:
+        return {
+            "error": "dictionary not found; set HXT_DICTIONARY_PATH to a docs/dictionary folder"
+        }
+    entries = dictionary.lookup(term)
+    if not entries:
+        return {"error": f"no dictionary entry named {term!r}", "entries": []}
+    return {"entries": entries}
+
+
+# --- agent ergonomics: handler-level script ops (phase 8a) ---------------------------------------
+
+
+@mcp.tool
+def list_handlers(handle: str) -> dict:
+    """List the handlers in an object's script.
+
+    Returns each handler's kind (on/command/function/getProp/setProp/before/after), name, and
+    start/end line numbers — so you can edit one handler without touching the rest.
+    """
+    res = _call("object.getScript", {"handle": handle})
+    if "error" in res:
+        return res
+    handlers = script_handlers.parse_handlers(res.get("script", ""))
+    return {"handlers": [h.as_dict() for h in handlers]}
+
+
+@mcp.tool
+def get_handler(handle: str, name: str) -> dict:
+    """Get the source text of a single handler `name` from an object's script."""
+    res = _call("object.getScript", {"handle": handle})
+    if "error" in res:
+        return res
+    h = script_handlers.find_handler(res.get("script", ""), name)
+    if h is None:
+        return {"error": f"no handler named {name!r}", "handler": None}
+    return {"name": h.name, "kind": h.kind, "start": h.start, "end": h.end, "text": h.text}
+
+
+@mcp.tool
+def set_handler(handle: str, name: str, handler_script: str) -> dict:
+    """Replace a single handler `name` in an object's script (appended if absent), leaving the other
+    handlers untouched.
+
+    The full resulting script is compile-checked by the engine; on a syntax error the original is
+    preserved and {"error": "compile: ..."} is returned.
+    """
+    res = _call("object.getScript", {"handle": handle})
+    if "error" in res:
+        return res
+    new_script = script_handlers.replace_or_append_handler(
+        res.get("script", ""), name, handler_script
+    )
+    return _call("object.setScript", {"handle": handle, "script": new_script})
+
+
+def _collect_script_targets(stack_handle: str, tree: dict) -> list[dict]:
+    """Every script-bearing object in a stack tree: the stack, each card, and all controls."""
+    targets = [{"handle": stack_handle, "name": tree.get("name", ""), "type": "stack"}]
+
+    def walk(controls: list) -> None:
+        for c in controls:
+            targets.append(
+                {"handle": c.get("handle"), "name": c.get("name", ""), "type": c.get("type", "")}
+            )
+            if c.get("children"):
+                walk(c["children"])
+
+    for card in _as_list(tree.get("cards")):
+        targets.append({"handle": card.get("handle"), "name": card.get("name", ""), "type": "card"})
+        walk(_normalize_controls(card.get("controls")))
+    return targets
+
+
+@mcp.tool
+def grep_scripts(stack_handle: str, pattern: str, ignore_case: bool = True) -> dict:
+    """Search every script in a stack (stack, cards, controls, widgets) for a regex `pattern`.
+
+    Returns matches with the object's handle/name/type, the 1-based line number, and the matching
+    line. Note: this reads each object's script in turn, so it is O(objects) bridge calls.
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return {"error": f"bad regex: {exc}"}
+    tree = _call("tree.get", {"handle": stack_handle})
+    if "error" in tree:
+        return tree
+    matches = []
+    targets = _collect_script_targets(stack_handle, tree)
+    for tgt in targets:
+        if not tgt["handle"]:
+            continue
+        sres = _call("object.getScript", {"handle": tgt["handle"]})
+        if "error" in sres:
+            continue
+        for lineno, line in enumerate(sres.get("script", "").split("\n"), 1):
+            if rx.search(line):
+                matches.append(
+                    {
+                        "handle": tgt["handle"],
+                        "object": tgt["name"],
+                        "objectType": tgt["type"],
+                        "line": lineno,
+                        "text": line.strip(),
+                    }
+                )
+    return {"matches": matches, "scanned": len(targets)}
 
 
 def main() -> None:
