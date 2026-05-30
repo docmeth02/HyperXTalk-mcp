@@ -58,7 +58,11 @@ def dictionary_root() -> Path | None:
         p = Path(env)
         return p if p.is_dir() else None
     dev = Path(__file__).resolve().parents[3] / "HyperXTalk" / "docs" / "dictionary"
-    return dev if dev.is_dir() else None
+    if dev.is_dir():
+        return dev
+    # installed macOS app bundle (best-effort; HXT_DICTIONARY_PATH is the portable override)
+    app = Path("/Applications/HyperXTalk.app/Contents/Tools/docs/dictionary")
+    return app if app.is_dir() else None
 
 
 def parse_lcdoc(text: str) -> dict:

@@ -17,3 +17,13 @@ def test_bridge_error_roundtrip() -> None:
     err = BridgeError.from_payload({"kind": "compile", "message": "boom", "line": 3, "col": 1})
     assert err.kind in ERROR_KINDS
     assert err.line == 3
+
+
+def test_launcher_reuses_entry_point() -> None:
+    # the mcp_server.py launcher and `python -m hyperxtalk_mcp` both call the real entry point
+    import hyperxtalk_mcp.__main__ as dunder_main
+    import mcp_server
+    from hyperxtalk_mcp.server import main
+
+    assert mcp_server.main is main
+    assert dunder_main.main is main

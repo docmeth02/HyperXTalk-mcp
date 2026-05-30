@@ -5,8 +5,30 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI agents (Claude Cod
 stacks / cards / controls / widgets, read & edit xTalk script (compile-checked), create / delete /
 modify controls and widgets, snapshot cards, and manage settings.
 
-> **Status:** early. The transport layer (agent ⇄ server ⇄ live IDE) is working and tested on macOS;
-> object discovery and editing are in progress.
+> **Status:** working and tested on macOS — discovery, editing, creation, snapshots, the language
+> dictionary, and handler-level script ops are all implemented (28 tools, integration-tested against
+> a live IDE). Windows/Linux verification is pending (the code is OS-agnostic by design).
+
+## Capabilities
+
+28 MCP tools, grouped by area:
+
+- **Discover & inspect** — `ping`, `list_stacks`, `get_tree`, `get_properties`, `get_script`,
+  `get_environment`, `list_extensions`
+- **Create & capture** — `create_stack`, `delete_stack` (unsaved scratch stacks only), `create_card`,
+  `snapshot` (card/control/group → PNG)
+- **Edit live stacks** — `create_control`, `create_widget`, `delete_object`, `clone_object`,
+  `set_properties`, `set_script` (compile-checked), `save_stack`, `save_stack_as`, `set_run_mode`
+- **Language dictionary** — `search_dictionary`, `lookup_dictionary` (real xTalk syntax from the
+  engine's own `.lcdoc` reference, so the agent writes correct code)
+- **Handler-level script work** — `list_handlers`, `get_handler`, `set_handler` (edit one handler
+  without disturbing siblings), `grep_scripts`
+- **Invoke & escape hatch** — `send_message` (invoke a handler defined on an object), `eval_xtalk`
+  (arbitrary `do`/`value`, **off by default** — must be enabled in the bridge palette Settings)
+
+All mutations are gated by a safe-to-edit check and a master pause switch; edits round-trip through
+the real engine, so scripts are validated by the actual parser. The bridge must be launched once per
+IDE session (see install step 1).
 
 ## How it works
 
@@ -47,7 +69,7 @@ answer the result
 
 This installs `hxt-mcp-bridge.livecode` into the user Plugins folder
 (`revEnvironmentUserPluginsPath()`) **and starts it immediately**. A successful run shows
-`installed to …; start result:` with nothing after `start result:`.
+`installed to …; bridge started as a palette`.
 
 For subsequent sessions, just launch it from **Development ▸ Plugins ▸ hxt-mcp-bridge** (there is no
 auto-start). On launch it binds a loopback ephemeral port and writes a handshake file to the per-user
@@ -64,17 +86,46 @@ put url ("file:" & specialFolderPath("home") & "/Library/Application Support/Hyp
 To stop the bridge: `send "hxtBridgeStop" to stack "hxt-mcp-bridge"`. It also stops when you close
 the plugin or quit the IDE. A diagnostic log is written to `~/hxt-mcp-bridge.log`.
 
-### 2. Run the MCP server
+### 2. Set up the Python server
 
 ```sh
 cd server
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'
-hyperxtalk-mcp          # runs the MCP server over stdio
+pip install -e .              # add '.[dev]' for ruff + pytest
 ```
 
-With the bridge running, the `ping` tool returns the engine version and platform; if the bridge
-isn't running it returns a clear "launch the bridge plugin" message.
+### 3. Register it with Claude Code
+
+From the `server/` directory (so `$(pwd)` resolves to absolute paths):
+
+```sh
+claude mcp add hyperxtalk "$(pwd)/.venv/bin/python" "$(pwd)/mcp_server.py" -s user
+```
+
+The launcher (`mcp_server.py`) runs the server over stdio. `-s user` makes it available in every
+project. Equivalent documented long form:
+
+```sh
+claude mcp add hyperxtalk --scope user -- "$(pwd)/.venv/bin/python" "$(pwd)/mcp_server.py"
+```
+
+The `search_dictionary` / `lookup_dictionary` tools auto-find the engine's docs in
+`/Applications/HyperXTalk.app` on macOS. For a non-default location (or Linux/Windows), point them at
+the docs explicitly by adding `-e HXT_DICTIONARY_PATH=/path/to/HyperXTalk/docs/dictionary` to the
+command above.
+
+Other MCP clients: run `"$(pwd)/.venv/bin/python" "$(pwd)/mcp_server.py"` as a stdio server (or
+`python -m hyperxtalk_mcp`).
+
+### 4. Verify
+
+In Claude Code, run `/mcp` and confirm `hyperxtalk` is **connected**, then ask Claude to call the
+`ping` tool — with the bridge running it returns the engine version and platform. If it reports the
+bridge isn't running, launch it: **Development ▸ Plugins ▸ hxt-mcp-bridge**.
+
+**Pitfalls:** run `claude mcp add` from `server/`; if you move the repo or recreate `.venv`, re-run
+it (Claude Code stored absolute paths). The bridge is not auto-started — launch it once per IDE
+session.
 
 ## Development
 
