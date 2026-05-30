@@ -183,7 +183,7 @@ end hxtDeleteHandshake
 -- ============================================================ socket reader (async)
 
 on __HxtAccept pSocketID, pLocalPort
-   put empty into sConn[pSocketID]
+   put the milliseconds into sConn[pSocketID]["acceptedAt"]   -- track this connection (definite key)
    read from socket pSocketID until (crlf & crlf) with message "__HxtHeaders"
 end __HxtAccept
 
@@ -275,10 +275,283 @@ private function hxtDispatch pId, pOperation, pParams
          wait tMs milliseconds with messages
          put tMs into tResult["waited"]
          return hxtOk(pId, tResult)
+      case "stacks.list"
+         return hxtOpStacksList(pId)
+      case "tree.get"
+         return hxtOpTreeGet(pId, pParams)
+      case "object.getProps"
+         return hxtOpGetProps(pId, pParams)
+      case "object.getScript"
+         return hxtOpGetScript(pId, pParams)
       default
          return hxtError(pId, "notfound", "unknown op:" && pOperation)
    end switch
 end hxtDispatch
+
+
+-- ============================================================ discovery + read (phase 2)
+
+-- stacks.list -> the open USER stacks (IDE/system stacks + the bridge itself excluded).
+private function hxtOpStacksList pId
+   local tResult, tStacks, tName, n
+   put 0 into n
+   repeat for each line tName in the openStacks
+      -- never list the bridge's own stack (dynamic, with the known name as a backstop)
+      if tName is the short name of me or tName is "hxt-mcp-bridge" then next repeat
+      if hxtIsIDEStack(tName) then next repeat
+      add 1 to n
+      put tName into tStacks[n]["name"]
+      put hxtStackHandle(tName) into tStacks[n]["handle"]
+      put the effective filename of stack tName into tStacks[n]["file"]
+      put (the mainStack of stack tName is tName) into tStacks[n]["isMainStack"]
+      put the number of cards of stack tName into tStacks[n]["cardCount"]
+   end repeat
+   put tStacks into tResult["stacks"]
+   return hxtOk(pId, tResult)
+end hxtOpStacksList
+
+-- tree.get -> cards (with nested control tree) for a stack handle.
+private function hxtOpTreeGet pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if tComp["kind"] is not "stack" then return hxtError(pId, "badarg", "tree.get expects a stack handle")
+
+   local tName, tCardIds, tCardId, tResult, tCards, n
+   put tComp["stack"] into tName
+   put the cardIDs of stack tName into tCardIds
+   put 0 into n
+   repeat for each line tCardId in tCardIds
+      add 1 to n
+      put tCardId into tCards[n]["id"]
+      put the short name of card id tCardId of stack tName into tCards[n]["name"]
+      put hxtObjHandle(tName, tCardId, "card", tCardId) into tCards[n]["handle"]
+      put hxtCardControls(tName, tCardId) into tCards[n]["controls"]
+   end repeat
+   put the short name of stack tName into tResult["name"]
+   put hxtStackHandle(tName) into tResult["handle"]
+   put tCards into tResult["cards"]
+   return hxtOk(pId, tResult)
+end hxtOpTreeGet
+
+-- object.getProps -> the (settable, JSON-safe) properties plus id/name/type/kind.
+private function hxtOpGetProps pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+
+   local tName, tCardId, tObjId, tProps
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   switch tComp["kind"]
+      case "stack"
+         put the properties of stack tName into tProps
+         put the id of stack tName into tProps["id"]
+         put the short name of stack tName into tProps["name"]
+         put "stack" into tProps["type"]
+         break
+      case "card"
+         put the properties of card id tCardId of stack tName into tProps
+         put tCardId into tProps["id"]
+         put the short name of card id tCardId of stack tName into tProps["name"]
+         put "card" into tProps["type"]
+         break
+      default
+         put the properties of control id tObjId of card id tCardId of stack tName into tProps
+         put tObjId into tProps["id"]
+         put the short name of control id tObjId of card id tCardId of stack tName into tProps["name"]
+         put word 1 of the long id of control id tObjId of card id tCardId of stack tName into tProps["type"]
+         if tProps["type"] is "widget" then
+            put the kind of widget id tObjId of card id tCardId of stack tName into tProps["kind"]
+         end if
+   end switch
+   local tResult
+   put tProps into tResult["props"]
+   return hxtOk(pId, tResult)
+end hxtOpGetProps
+
+-- object.getScript -> the script of any object.
+private function hxtOpGetScript pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+
+   local tName, tCardId, tObjId, tScript
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   switch tComp["kind"]
+      case "stack"
+         put the script of stack tName into tScript
+         break
+      case "card"
+         put the script of card id tCardId of stack tName into tScript
+         break
+      default
+         put the script of control id tObjId of card id tCardId of stack tName into tScript
+   end switch
+   local tResult
+   put tScript into tResult["script"]
+   return hxtOk(pId, tResult)
+end hxtOpGetScript
+
+
+-- ---- control-tree enumeration (number of controls is FLAT, so filter top-level by owner) ----
+
+private function hxtCardControls pStack, pCardId
+   local tCtrls, n, i, tCount, tCid, tOwnerType
+   put 0 into n
+   put the number of controls of card id pCardId of stack pStack into tCount
+   repeat with i = 1 to tCount
+      put the id of control i of card id pCardId of stack pStack into tCid
+      put word 1 of the long owner of control id tCid of card id pCardId of stack pStack into tOwnerType
+      -- top-level = owned by the card, OR by the stack (shared/background groups placed on the card).
+      -- Controls owned by a group are emitted via that group's children, so skip them here.
+      if tOwnerType is not "card" and tOwnerType is not "stack" then next repeat
+      add 1 to n
+      put hxtControlEntry(pStack, pCardId, tCid) into tCtrls[n]
+   end repeat
+   return tCtrls
+end hxtCardControls
+
+private function hxtGroupChildren pStack, pCardId, pGroupId
+   local tKids, n, tChildIds, tChildId
+   put 0 into n
+   put the childControlIDs of group id pGroupId of card id pCardId of stack pStack into tChildIds
+   repeat for each line tChildId in tChildIds
+      add 1 to n
+      put hxtControlEntry(pStack, pCardId, tChildId) into tKids[n]
+   end repeat
+   return tKids
+end hxtGroupChildren
+
+private function hxtControlEntry pStack, pCardId, pCid
+   local tEntry, tType
+   put word 1 of the long id of control id pCid of card id pCardId of stack pStack into tType
+   put pCid into tEntry["id"]
+   put the short name of control id pCid of card id pCardId of stack pStack into tEntry["name"]
+   put tType into tEntry["type"]
+   put hxtObjHandle(pStack, pCardId, tType, pCid) into tEntry["handle"]
+   if tType is "widget" then
+      put the kind of widget id pCid of card id pCardId of stack pStack into tEntry["kind"]
+   end if
+   if tType is "group" then
+      put hxtGroupChildren(pStack, pCardId, pCid) into tEntry["children"]
+   end if
+   return tEntry
+end hxtControlEntry
+
+
+-- ---- handles + resolution ----
+
+private function hxtIsIDEStack pName
+   local tIsIDE
+   try
+      put revStackNameIsIDEStack(pName) into tIsIDE
+      return tIsIDE
+   catch tIgnore
+      -- headless / IDE library absent: conservative fallback
+      if pName begins with "rev" then return true
+      if pName begins with "com.livecode." then return true
+      if pName is among the items of "message box,answer dialog,ask dialog,home" then return true
+      return false
+   end try
+end hxtIsIDEStack
+
+private function hxtStackHandle pName
+   local tH
+   put 1 into tH["v"]
+   put pName into tH["stack"]["shortName"]
+   put the mainStack of stack pName into tH["stack"]["mainStackName"]
+   put the effective filename of stack pName into tH["stack"]["fileName"]
+   put the id of stack pName into tH["stack"]["stackId"]
+   put 0 into tH["cardId"]
+   put "stack" into tH["objType"]
+   put the id of stack pName into tH["objId"]
+   return hxtEncodeHandle(tH)
+end hxtStackHandle
+
+private function hxtObjHandle pStackName, pCardId, pType, pObjId
+   local tH
+   put 1 into tH["v"]
+   put pStackName into tH["stack"]["shortName"]
+   put the mainStack of stack pStackName into tH["stack"]["mainStackName"]
+   put the effective filename of stack pStackName into tH["stack"]["fileName"]
+   put the id of stack pStackName into tH["stack"]["stackId"]
+   put pCardId into tH["cardId"]
+   put pType into tH["objType"]
+   put pObjId into tH["objId"]
+   return hxtEncodeHandle(tH)
+end hxtObjHandle
+
+private function hxtEncodeHandle pArray
+   local tEnc
+   put base64Encode(textEncode(JsonExport(pArray), "UTF-8")) into tEnc
+   replace return with empty in tEnc
+   replace linefeed with empty in tEnc
+   return tEnc
+end hxtEncodeHandle
+
+private function hxtDecodeHandle pHandle
+   local tArr
+   try
+      put JsonImport(textDecode(base64Decode(pHandle), "UTF-8")) into tArr
+      return tArr
+   catch tIgnore
+      return empty
+   end try
+end hxtDecodeHandle
+
+-- Resolve a handle fail-closed against the open-stack set. Returns a comp array;
+-- comp["error"] is set ("badarg" | "stale_handle") if it can't be resolved.
+private function hxtResolveComp pHandle
+   local tH, tComp
+   put hxtDecodeHandle(pHandle) into tH
+   if tH is empty or tH["stack"] is not an array then
+      put "badarg" into tComp["error"]
+      return tComp
+   end if
+
+   local tName
+   put hxtFindOpenStack(tH["stack"]) into tName
+   if tName is empty then
+      put "stale_handle" into tComp["error"]
+      return tComp
+   end if
+   put tName into tComp["stack"]
+   put tH["cardId"] into tComp["cardId"]
+   put tH["objId"] into tComp["objId"]
+   put tH["objType"] into tComp["kind"]
+
+   local tCardId, tObjId, tExists
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   switch tComp["kind"]
+      case "stack"
+         put (there is a stack tName) into tExists
+         break
+      case "card"
+         put (there is a card id tCardId of stack tName) into tExists
+         break
+      default
+         put (there is a control id tObjId of card id tCardId of stack tName) into tExists
+   end switch
+   if not tExists then put "stale_handle" into tComp["error"]
+   return tComp
+end hxtResolveComp
+
+-- Fail-closed: only ever returns the name of an already-open stack whose id matches.
+-- Never references stack "name" speculatively (that can side-effect-load by filename).
+private function hxtFindOpenStack pStackKey
+   local tName
+   repeat for each line tName in the openStacks
+      if tName is pStackKey["shortName"] then
+         if (the id of stack tName) is pStackKey["stackId"] then return tName
+      end if
+   end repeat
+   return empty
+end hxtFindOpenStack
 
 
 -- ============================================================ HTTP response
@@ -310,6 +583,13 @@ on socketTimeout pSocketID
 end socketTimeout
 
 private command hxtCleanupSocket pSocketID
+   -- Only ever tear down a TRACKED CONNECTION socket (one in sConn). The listening socket is never
+   -- in sConn, so this is robust regardless of how socketTimeout/socketError identify the listener.
+   -- (socketTimeout fires for the idle listener every interval — it's always "pending".)
+   hxtLog "cleanup: socket=" & pSocketID & " listener=" & sListenPort & \
+      " inConn=" & (pSocketID is among the lines of the keys of sConn)
+   if pSocketID is sListenPort then exit hxtCleanupSocket
+   if pSocketID is not among the lines of the keys of sConn then exit hxtCleanupSocket
    if pSocketID is sBusySocket then
       put "idle" into sState
       put empty into sBusySocket
