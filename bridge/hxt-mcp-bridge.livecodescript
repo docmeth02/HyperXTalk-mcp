@@ -18,6 +18,7 @@ constant kHandshakeName = "mcp-bridge.json"
 constant kMaxBody = 67108864      -- 64 MB request-body cap (OOM guard)
 constant kSocketTimeout = 30000   -- ms; releases hung connections (frees the busy token)
 constant kCreatableTypes = "button,field,graphic,image,scrollbar,player,group"
+constant kLogMax = 500            -- max lines kept in the palette's Log tab
 
 local sListenPort        -- the listening (server) socket id == its port; empty when stopped
 local sToken             -- per-session shared secret
@@ -27,12 +28,15 @@ local sConn              -- per-connection scratch: sConn[socket]["token"|"metho
 local sPaused            -- master "pause edits" switch (panel/tool); blocks mutations when true
 local sKeepAliveID       -- pending keepAlive message id, so we can cancel it cleanly
 local sLastCreatedId     -- numeric id of the just-created control (captured inside the create `do`)
+local sAllowDo           -- escape-hatch (do/value) opt-in; off by default (gates a phase-8 op)
+local sLog               -- ring buffer of recent request lines (for the Log tab)
 
 
 -- ============================================================ lifecycle
 
 on openStack
    hxtBridgeStart
+   hxtRefreshStatus
 end openStack
 
 on closeStack
@@ -65,6 +69,8 @@ command hxtBridgeStart
       put "idle" into sState
       put empty into sBusySocket
       put false into sPaused
+      put false into sAllowDo
+      put empty into sLog
       put hxtMakeToken() into sToken
       set the socketTimeoutInterval to kSocketTimeout
 
@@ -94,8 +100,11 @@ command hxtBridgeStart
       hxtLog "ready: handshake at" && hxtHandshakePath()
       send "hxtKeepAlive" to me in 30 seconds   -- keeps a pending ref + drives the watchdog
       put the result into sKeepAliveID
+      hxtRefreshStatus
       return empty
    catch tException
+      -- don't leave the IDE's network interface pinned to loopback if accept threw mid-way
+      set the defaultNetworkInterface to empty
       hxtLog "EXCEPTION in hxtBridgeStart:" && tException
       return "exception:" && tException
    end try
@@ -127,6 +136,7 @@ command hxtBridgeStop
    put empty into sToken
    put "idle" into sState
    put empty into sBusySocket
+   hxtRefreshStatus
 end hxtBridgeStop
 
 function hxtBridgeStatus
@@ -148,6 +158,150 @@ on hxtKeepAlive
    send "hxtKeepAlive" to me in 30 seconds
    put the result into sKeepAliveID
 end hxtKeepAlive
+
+
+-- ============================================================ palette UI (phase 5)
+
+-- (Re)build the control-panel UI on this stack. Called once by build-plugin; idempotent.
+command hxtBuildUI
+   -- `create` targets the defaultStack, so point it at us during the build, then restore it.
+   local tOldDefault
+   put the defaultStack into tOldDefault
+   set the defaultStack to the long id of me
+   set the width of me to 440
+   set the height of me to 340
+   set the title of me to "HyperXTalk MCP Bridge"
+
+   local tNames, tN
+   put "hxtTabs,hxtLight,hxtStatusText,hxtPause,hxtEscape,hxtTokenLabel,hxtToken,hxtLog" into tNames
+   repeat for each item tN in tNames
+      if there is a control tN of card 1 of me then delete control tN of card 1 of me
+   end repeat
+
+   -- tabbed frame
+   create button "hxtTabs"
+   set the style of button "hxtTabs" to "menu"
+   set the menuMode of button "hxtTabs" to "tabbed"
+   set the showName of button "hxtTabs" to false
+   set the text of button "hxtTabs" to "Status" & return & "Settings" & return & "Log"
+   set the rect of button "hxtTabs" to 8,8,432,332
+
+   -- Status tab
+   create graphic "hxtLight"
+   set the style of graphic "hxtLight" to "oval"
+   set the opaque of graphic "hxtLight" to true
+   set the lineSize of graphic "hxtLight" to 0
+   set the rect of graphic "hxtLight" to 22,56,40,74
+   create field "hxtStatusText"
+   set the lockText of field "hxtStatusText" to true
+   set the showBorder of field "hxtStatusText" to false
+   set the opaque of field "hxtStatusText" to false
+   set the rect of field "hxtStatusText" to 48,52,420,76
+
+   -- Settings tab
+   create button "hxtPause"
+   set the style of button "hxtPause" to "checkbox"
+   set the label of button "hxtPause" to "Pause edits (block all mutations)"
+   set the rect of button "hxtPause" to 22,50,400,72
+   create button "hxtEscape"
+   set the style of button "hxtEscape" to "checkbox"
+   set the label of button "hxtEscape" to "Allow do / value escape hatch"
+   set the rect of button "hxtEscape" to 22,78,400,100
+   create field "hxtTokenLabel"
+   set the lockText of field "hxtTokenLabel" to true
+   set the showBorder of field "hxtTokenLabel" to false
+   set the rect of field "hxtTokenLabel" to 22,118,420,138
+   put "Session token:" into field "hxtTokenLabel"
+   create field "hxtToken"
+   set the lockText of field "hxtToken" to true
+   set the rect of field "hxtToken" to 22,140,420,162
+
+   -- Log tab
+   create field "hxtLog"
+   set the lockText of field "hxtLog" to true
+   set the dontWrap of field "hxtLog" to true
+   set the vScrollbar of field "hxtLog" to true
+   set the rect of field "hxtLog" to 16,46,424,322
+
+   hxtShowTab 1
+   hxtRefreshStatus
+   set the defaultStack to tOldDefault
+end hxtBuildUI
+
+private command hxtShowTab pIndex
+   if there is no button "hxtTabs" of me then exit hxtShowTab
+   set the menuHistory of button "hxtTabs" of me to pIndex
+   set the visible of graphic "hxtLight" of me to (pIndex is 1)
+   set the visible of field "hxtStatusText" of me to (pIndex is 1)
+   set the visible of button "hxtPause" of me to (pIndex is 2)
+   set the visible of button "hxtEscape" of me to (pIndex is 2)
+   set the visible of field "hxtTokenLabel" of me to (pIndex is 2)
+   set the visible of field "hxtToken" of me to (pIndex is 2)
+   set the visible of field "hxtLog" of me to (pIndex is 3)
+   if pIndex is 3 then  -- sync the (lazily-updated) log when its tab becomes visible
+      set the text of field "hxtLog" of me to sLog
+      set the vScroll of field "hxtLog" of me to the formattedHeight of field "hxtLog" of me
+   end if
+end hxtShowTab
+
+-- Update the traffic light, status text, token, and toggle states. No-op if the UI isn't built.
+command hxtRefreshStatus
+   if there is no field "hxtStatusText" of me then exit hxtRefreshStatus
+   if sListenPort is not empty then
+      set the backgroundColor of graphic "hxtLight" of me to "0,170,0"
+      put "Listening on 127.0.0.1 port" && sListenPort into field "hxtStatusText" of me
+   else
+      set the backgroundColor of graphic "hxtLight" of me to "200,40,40"
+      put "Stopped" into field "hxtStatusText" of me
+   end if
+   put sToken into field "hxtToken" of me
+   set the hilite of button "hxtPause" of me to (sPaused is true)
+   set the hilite of button "hxtEscape" of me to (sAllowDo is true)
+end hxtRefreshStatus
+
+-- Append a line to the Log tab's ring buffer. Only repaints the field if the Log tab is visible.
+command hxtUILog pLine
+   put (the long time && pLine) & return after sLog
+   local tExtra
+   put the number of lines of sLog - kLogMax into tExtra
+   if tExtra > 0 then delete line 1 to tExtra of sLog
+   if there is no field "hxtLog" of me then exit hxtUILog
+   if the visible of field "hxtLog" of me then
+      set the text of field "hxtLog" of me to sLog
+      set the vScroll of field "hxtLog" of me to the formattedHeight of field "hxtLog" of me
+   end if
+end hxtUILog
+
+-- UI wiring: tab clicks and the Settings checkboxes.
+on menuPick pTab
+   if the short name of the target is not "hxtTabs" then
+      pass menuPick
+   end if
+   switch pTab
+      case "Status"
+         hxtShowTab 1
+         break
+      case "Settings"
+         hxtShowTab 2
+         break
+      case "Log"
+         hxtShowTab 3
+         break
+   end switch
+end menuPick
+
+on mouseUp
+   switch the short name of the target
+      case "hxtPause"
+         put (the hilite of button "hxtPause" of me is true) into sPaused
+         break
+      case "hxtEscape"
+         put (the hilite of button "hxtEscape" of me is true) into sAllowDo
+         break
+      default
+         pass mouseUp
+   end switch
+end mouseUp
 
 
 -- ============================================================ logging
@@ -289,6 +443,7 @@ private command hxtHandle pSocketID, pBody
    put tReq["id"] into tId
    put tReq["op"] into tOperation
    put tReq["params"] into tParams
+   hxtUILog tOperation
 
    -- strict one-in-flight: only the async response-write window can overlap, so guard it.
    if sState is "busy" then

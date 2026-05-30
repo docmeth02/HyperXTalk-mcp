@@ -34,25 +34,34 @@ command hxtBuildPlugin pScriptPath
    if the result is not empty then
       return "COMPILE ERROR in bridge script:" && the result
    end if
-   set the cREVLoadInfo["mode"] of stack "hxt-mcp-bridge" to "invisible"
+   -- build the control-panel UI, then mark it a palette plugin
+   local tUIErr
+   try
+      send "hxtBuildUI" to stack "hxt-mcp-bridge"
+      put the result into tUIErr
+   catch tErr
+      put "exception:" && tErr into tUIErr
+   end try
+   if tUIErr is not empty then return "UI build error:" && tUIErr
+   set the cREVLoadInfo["mode"] of stack "hxt-mcp-bridge" to "palette"
    save stack "hxt-mcp-bridge" as tDest
 
-   -- send (not dispatch) so hxtBridgeStart's return value reaches `the result`; the handler
-   -- definitely exists here. Wrap in try so a runtime error still surfaces.
-   local tStart
-   try
-      send "hxtBridgeStart" to stack "hxt-mcp-bridge"
-      put the result into tStart
-   catch tErr
-      put "exception:" && tErr into tStart
-   end try
-   return "installed to" && tDest & "; start result:" && tStart
+   -- show it as a palette; opening fires openStack -> hxtBridgeStart -> hxtRefreshStatus
+   palette stack "hxt-mcp-bridge"
+   return "installed to" && tDest & "; bridge started as a palette"
 end hxtBuildPlugin
 
 private command hxtKillBridgeStack
    if there is a stack "hxt-mcp-bridge" then
       try
          dispatch "hxtBridgeStop" to stack "hxt-mcp-bridge"
+      catch tIgnore
+      end try
+      -- An OPEN palette with destroyStack=false won't fully delete; force it so the rebuild is clean.
+      set the destroyStack of stack "hxt-mcp-bridge" to true
+      set the dirty of stack "hxt-mcp-bridge" to false   -- avoid a save-confirmation prompt
+      try
+         close stack "hxt-mcp-bridge"
       catch tIgnore
       end try
       delete stack "hxt-mcp-bridge"
