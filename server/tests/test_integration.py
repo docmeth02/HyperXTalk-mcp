@@ -65,6 +65,31 @@ def test_discovery_and_read_real_bridge():
 
 
 @_skip
+def test_safe_to_edit_real_bridge():
+    """The pause switch flips safeToEdit; pause is checked first so it's robust to stack state."""
+    from hyperxtalk_mcp.server import _as_list, _normalize_controls
+
+    c = BridgeClient(timeout=15)
+    stacks = _as_list(c.call("stacks.list").get("stacks"))
+    if not stacks:
+        pytest.skip("no user stacks open in HyperXTalk")
+    tree = c.call("tree.get", {"handle": stacks[0]["handle"]})
+    cards = _as_list(tree.get("cards"))
+    ctrls = _normalize_controls(cards[0].get("controls"))
+    handle = (ctrls[0] if ctrls else cards[0])["handle"]
+
+    try:
+        c.call("bridge.setPaused", {"paused": True})
+        paused = c.call("bridge.safeToEdit", {"handle": handle})
+        assert paused["safe"] is False and paused["reason"] == "paused"
+    finally:
+        c.call("bridge.setPaused", {"paused": False})
+
+    after = c.call("bridge.safeToEdit", {"handle": handle, "operation": "setProps"})
+    assert after.get("reason") != "paused"  # unpaused (safe, or some other concrete reason)
+
+
+@_skip
 def test_stale_handle_real_bridge():
     """A handle for a stack that isn't open resolves fail-closed to stale_handle."""
     from hyperxtalk_mcp import handles

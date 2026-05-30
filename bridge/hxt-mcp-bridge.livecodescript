@@ -23,6 +23,7 @@ local sToken             -- per-session shared secret
 local sState             -- "idle" | "busy" (strict one-in-flight)
 local sBusySocket        -- the connection socket currently holding the busy token
 local sConn              -- per-connection scratch: sConn[socket]["token"|"method"|"path"|"contentLength"]
+local sPaused            -- master "pause edits" switch (panel/tool); blocks mutations when true
 
 
 -- ============================================================ lifecycle
@@ -44,6 +45,7 @@ command hxtBridgeStart
       hxtLog "start: platform=" & the platform & ", folder=" & hxtHandshakeFolder()
       put "idle" into sState
       put empty into sBusySocket
+      put false into sPaused
       put hxtMakeToken() into sToken
       set the socketTimeoutInterval to kSocketTimeout
 
@@ -71,6 +73,7 @@ command hxtBridgeStart
          return "handshake write failed:" && tHsErr
       end if
       hxtLog "ready: handshake at" && hxtHandshakePath()
+      send "hxtKeepAlive" to me in 30 seconds   -- keep this (invisible) stack resident, not purged
       return empty
    catch tException
       hxtLog "EXCEPTION in hxtBridgeStart:" && tException
@@ -98,6 +101,13 @@ end hxtBridgeStop
 function hxtBridgeStatus
    return "port:" && sListenPort & comma & "state:" && sState
 end hxtBridgeStatus
+
+-- Self-rescheduling timer: keeps the invisible stack referenced (so the engine doesn't purge it)
+-- and logs listener liveness each cycle for diagnosis.
+on hxtKeepAlive
+   if sListenPort is empty then exit hxtKeepAlive   -- bridge stopped; let the timer lapse
+   send "hxtKeepAlive" to me in 30 seconds
+end hxtKeepAlive
 
 
 -- ============================================================ logging
@@ -283,6 +293,10 @@ private function hxtDispatch pId, pOperation, pParams
          return hxtOpGetProps(pId, pParams)
       case "object.getScript"
          return hxtOpGetScript(pId, pParams)
+      case "bridge.safeToEdit"
+         return hxtOpSafeToEdit(pId, pParams)
+      case "bridge.setPaused"
+         return hxtOpSetPaused(pId, pParams)
       default
          return hxtError(pId, "notfound", "unknown op:" && pOperation)
    end switch
@@ -395,6 +409,90 @@ private function hxtOpGetScript pId, pParams
    put tScript into tResult["script"]
    return hxtOk(pId, tResult)
 end hxtOpGetScript
+
+
+-- ============================================================ safe-to-edit (phase 3)
+
+-- bridge.safeToEdit -> {safe, reason}. The reason vocabulary:
+--   paused | stack_cant_modify | cant_delete | open_in_editor
+private function hxtOpSafeToEdit pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   local tOperation, tReason, tResult
+   put pParams["operation"] into tOperation
+   if tOperation is empty then put "edit" into tOperation
+   put hxtSafeToEdit(tComp, tOperation) into tReason
+   put (tReason is empty) into tResult["safe"]
+   if tReason is not empty then put tReason into tResult["reason"]
+   return hxtOk(pId, tResult)
+end hxtOpSafeToEdit
+
+-- bridge.setPaused -> set/clear the master pause switch.
+private function hxtOpSetPaused pId, pParams
+   if pParams["paused"] is true or pParams["paused"] is "true" then
+      put true into sPaused
+   else
+      put false into sPaused
+   end if
+   local tResult
+   put sPaused into tResult["paused"]
+   return hxtOk(pId, tResult)
+end hxtOpSetPaused
+
+-- Returns empty if it's safe to mutate the resolved object, else a reason string.
+-- pOperation: "setScript" | "setProps" | "delete" | "create" | "edit". Used by phase-4 mutations.
+-- NOTE: active drag and group-edit mode are NOT queryable from xTalk; the manual pause switch is the
+-- coarse guard for "user is interacting". Executing-script and compiled-library are handled at the
+-- mutation site (try/catch + read-back verify) since neither is queryable up front.
+private function hxtSafeToEdit pComp, pOperation
+   if sPaused then return "paused"
+
+   local tName, tCardId, tObjId, tKind
+   put pComp["stack"] into tName
+   put pComp["cardId"] into tCardId
+   put pComp["objId"] into tObjId
+   put pComp["kind"] into tKind
+
+   -- the author marked the stack non-editable (typically a running stack)
+   if the cantModify of stack tName then return "stack_cant_modify"
+
+   -- a delete the engine would refuse anyway
+   if pOperation is "delete" then
+      switch tKind
+         case "card"
+            if the cantDelete of card id tCardId of stack tName then return "cant_delete"
+            break
+         case "stack"
+            break
+         default
+            if the cantDelete of control id tObjId of card id tCardId of stack tName then
+               return "cant_delete"
+            end if
+      end switch
+   end if
+
+   -- would clobber unsaved work if the object's script is open in the IDE script editor
+   local tLongId, tEditing
+   switch tKind
+      case "stack"
+         put the long id of stack tName into tLongId
+         break
+      case "card"
+         put the long id of card id tCardId of stack tName into tLongId
+         break
+      default
+         put the long id of control id tObjId of card id tCardId of stack tName into tLongId
+   end switch
+   try
+      put revIDEScriptEditingObjects() into tEditing
+   catch tIgnore
+      put empty into tEditing   -- IDE library absent (headless) -> can't check; treat as not-open
+   end try
+   if tLongId is among the lines of tEditing then return "open_in_editor"
+
+   return empty
+end hxtSafeToEdit
 
 
 -- ---- control-tree enumeration (number of controls is FLAT, so filter top-level by owner) ----
@@ -586,8 +684,6 @@ private command hxtCleanupSocket pSocketID
    -- Only ever tear down a TRACKED CONNECTION socket (one in sConn). The listening socket is never
    -- in sConn, so this is robust regardless of how socketTimeout/socketError identify the listener.
    -- (socketTimeout fires for the idle listener every interval — it's always "pending".)
-   hxtLog "cleanup: socket=" & pSocketID & " listener=" & sListenPort & \
-      " inConn=" & (pSocketID is among the lines of the keys of sConn)
    if pSocketID is sListenPort then exit hxtCleanupSocket
    if pSocketID is not among the lines of the keys of sConn then exit hxtCleanupSocket
    if pSocketID is sBusySocket then
