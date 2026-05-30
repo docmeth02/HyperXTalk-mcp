@@ -24,13 +24,22 @@ def test_corrupt_handshake_returns_none(handshake_file):
     assert bridge_client.find_handshake() is None
 
 
-def test_live_pid_handshake_is_returned(handshake_file):
+def test_live_pid_handshake_is_returned(handshake_file, monkeypatch):
+    monkeypatch.setattr(bridge_client, "_port_reachable", lambda port: True)
     handshake_file.write_text(
         json.dumps({"port": 49152, "token": "abc", "pid": os.getpid()}), encoding="utf-8"
     )
     data = bridge_client.find_handshake()
     assert data is not None
     assert data["port"] == 49152
+
+
+def test_unreachable_port_handshake_is_ignored(handshake_file, monkeypatch):
+    monkeypatch.setattr(bridge_client, "_port_reachable", lambda port: False)
+    handshake_file.write_text(
+        json.dumps({"port": 49152, "token": "abc", "pid": os.getpid()}), encoding="utf-8"
+    )
+    assert bridge_client.find_handshake() is None
 
 
 def test_stale_pid_handshake_is_ignored(handshake_file):

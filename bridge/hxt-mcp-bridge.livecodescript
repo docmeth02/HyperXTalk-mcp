@@ -17,6 +17,7 @@ constant kBridgeVersion = "0.0.1"
 constant kHandshakeName = "mcp-bridge.json"
 constant kMaxBody = 67108864      -- 64 MB request-body cap (OOM guard)
 constant kSocketTimeout = 30000   -- ms; releases hung connections (frees the busy token)
+constant kCreatableTypes = "button,field,graphic,image,scrollbar,player,group"
 
 local sListenPort        -- the listening (server) socket id == its port; empty when stopped
 local sToken             -- per-session shared secret
@@ -25,6 +26,7 @@ local sBusySocket        -- the connection socket currently holding the busy tok
 local sConn              -- per-connection scratch: sConn[socket]["token"|"method"|"path"|"contentLength"]
 local sPaused            -- master "pause edits" switch (panel/tool); blocks mutations when true
 local sKeepAliveID       -- pending keepAlive message id, so we can cancel it cleanly
+local sLastCreatedId     -- numeric id of the just-created control (captured inside the create `do`)
 
 
 -- ============================================================ lifecycle
@@ -41,8 +43,24 @@ end closeStack
 -- Returns empty on success, or an error string. Also logs to ~/hxt-mcp-bridge.log either way,
 -- because `dispatch` (used by some callers) discards the return value.
 command hxtBridgeStart
+   global gHxtMcpBridgeOwner
    if sListenPort is not empty then return "already running on port" && sListenPort
+   -- Singleton guard: a second instance must not start and overwrite the shared handshake file.
+   -- But clear a STALE owner (a stack id that no longer exists) so we never lock ourselves out.
+   if gHxtMcpBridgeOwner is not empty and gHxtMcpBridgeOwner is not (the long id of me) then
+      if there is a stack (gHxtMcpBridgeOwner) then
+         hxtLog "start refused: bridge already owned by" && gHxtMcpBridgeOwner
+         return "bridge already owned by another instance"
+      end if
+      hxtLog "clearing stale bridge owner:" && gHxtMcpBridgeOwner
+      put empty into gHxtMcpBridgeOwner
+   end if
+   put the long id of me into gHxtMcpBridgeOwner
    try
+      -- ROOT-CAUSE FIX: stop the engine from purging this invisible stack. When the owner object is
+      -- destroyed, IO_freeobject (mcio.cpp) closes its sockets WITHOUT firing closeStack, killing the
+      -- listener with the handshake still present. destroyStack=false keeps the stack resident.
+      set the destroyStack of me to false
       hxtLog "start: platform=" & the platform & ", folder=" & hxtHandshakeFolder()
       put "idle" into sState
       put empty into sBusySocket
@@ -74,7 +92,8 @@ command hxtBridgeStart
          return "handshake write failed:" && tHsErr
       end if
       hxtLog "ready: handshake at" && hxtHandshakePath()
-      hxtScheduleKeepAlive   -- keep this (invisible) stack resident, not purged
+      send "hxtKeepAlive" to me in 30 seconds   -- keeps a pending ref + drives the watchdog
+      put the result into sKeepAliveID
       return empty
    catch tException
       hxtLog "EXCEPTION in hxtBridgeStart:" && tException
@@ -83,10 +102,17 @@ command hxtBridgeStart
 end hxtBridgeStart
 
 command hxtBridgeStop
-   if sKeepAliveID is not empty then
-      cancel sKeepAliveID
-      put empty into sKeepAliveID
-   end if
+   global gHxtMcpBridgeOwner
+   hxtLog "bridgeStop called (port=" & sListenPort & ")"
+   -- Cancel ALL pending keepAlive timers (the captured id can be unreliable), so a rebuild truly
+   -- stops the old instance instead of leaving a duplicate running.
+   local tMsg
+   repeat for each line tMsg in the pendingMessages
+      -- match by substring (the target's long id can contain commas, shifting item positions)
+      if tMsg contains "hxtKeepAlive" then cancel (item 1 of tMsg)
+   end repeat
+   put empty into sKeepAliveID
+   if gHxtMcpBridgeOwner is (the long id of me) then put empty into gHxtMcpBridgeOwner
    if sListenPort is not empty then
       if sListenPort is among the lines of the openSockets then close socket sListenPort
    end if
@@ -111,14 +137,17 @@ end hxtBridgeStatus
 -- and logs listener liveness each cycle for diagnosis.
 on hxtKeepAlive
    if sListenPort is empty then exit hxtKeepAlive   -- bridge stopped; let the timer lapse
-   hxtScheduleKeepAlive
-end hxtKeepAlive
-
-private command hxtScheduleKeepAlive
-   if sKeepAliveID is not empty then cancel sKeepAliveID   -- avoid duplicate timer loops
+   -- If the listener vanished, just clear our stale handshake and stop. Do NOT re-accept on a new
+   -- port (that caused handshake churn / refusals). destroyStack=false is the real keep-alive.
+   if sListenPort is not among the lines of the openSockets then
+      hxtLog "listener missing; clearing stale handshake (no re-accept)"
+      hxtDeleteHandshake
+      put empty into sListenPort
+      exit hxtKeepAlive
+   end if
    send "hxtKeepAlive" to me in 30 seconds
    put the result into sKeepAliveID
-end hxtScheduleKeepAlive
+end hxtKeepAlive
 
 
 -- ============================================================ logging
@@ -269,7 +298,14 @@ private command hxtHandle pSocketID, pBody
    put "busy" into sState
    put pSocketID into sBusySocket
 
-   hxtRespond pSocketID, 200, hxtDispatch(tId, tOperation, tParams)
+   -- Never let an op exception hang the bridge: always send a response (clears busy via __HxtWritten).
+   local tBody
+   try
+      put hxtDispatch(tId, tOperation, tParams) into tBody
+   catch tExc
+      put hxtError(tId, "runtime", "op exception:" && tExc) into tBody
+   end try
+   hxtRespond pSocketID, 200, tBody
 end hxtHandle
 
 
@@ -308,6 +344,22 @@ private function hxtDispatch pId, pOperation, pParams
          return hxtOpSafeToEdit(pId, pParams)
       case "bridge.setPaused"
          return hxtOpSetPaused(pId, pParams)
+      case "control.create"
+         return hxtOpControlCreate(pId, pParams)
+      case "widget.create"
+         return hxtOpWidgetCreate(pId, pParams)
+      case "object.delete"
+         return hxtOpDelete(pId, pParams)
+      case "object.clone"
+         return hxtOpClone(pId, pParams)
+      case "object.setProps"
+         return hxtOpSetProps(pId, pParams)
+      case "object.setScript"
+         return hxtOpSetScript(pId, pParams)
+      case "stack.save"
+         return hxtOpStackSave(pId, pParams)
+      case "stack.saveAs"
+         return hxtOpStackSaveAs(pId, pParams)
       default
          return hxtError(pId, "notfound", "unknown op:" && pOperation)
    end switch
@@ -468,19 +520,21 @@ private function hxtSafeToEdit pComp, pOperation
    -- the author marked the stack non-editable (typically a running stack)
    if the cantModify of stack tName then return "stack_cant_modify"
 
-   -- a delete the engine would refuse anyway
-   if pOperation is "delete" then
-      switch tKind
-         case "card"
-            if the cantDelete of card id tCardId of stack tName then return "cant_delete"
-            break
-         case "stack"
-            break
-         default
-            if the cantDelete of control id tObjId of card id tCardId of stack tName then
-               return "cant_delete"
-            end if
-      end switch
+   -- a delete the engine would refuse anyway. `the cantDelete` throws EE_OBJECT_GETNOPROP on some
+   -- control types (e.g. plain buttons), so guard the get and treat "unsupported" as deletable.
+   if pOperation is "delete" and tKind is not "stack" then
+      local tCantDelete
+      put false into tCantDelete
+      try
+         if tKind is "card" then
+            put the cantDelete of card id tCardId of stack tName into tCantDelete
+         else
+            put the cantDelete of control id tObjId of card id tCardId of stack tName into tCantDelete
+         end if
+      catch tIgnore
+         put false into tCantDelete
+      end try
+      if tCantDelete is true then return "cant_delete"
    end if
 
    -- would clobber unsaved work if the object's script is open in the IDE script editor
@@ -504,6 +558,288 @@ private function hxtSafeToEdit pComp, pOperation
 
    return empty
 end hxtSafeToEdit
+
+
+-- ============================================================ mutations (phase 4)
+
+-- A chunk expression (as a string, for use only inside `do`) referencing a card or group parent.
+-- Returns empty if the parent isn't a card/group or the stack name is unsafe to interpolate.
+private function hxtParentChunk pComp
+   local tName, tCardId
+   put pComp["stack"] into tName
+   put pComp["cardId"] into tCardId
+   if tName contains quote then return empty
+   switch pComp["kind"]
+      case "card"
+         return "card id" && tCardId && "of stack" && quote & tName & quote
+      case "group"
+         return "group id" && pComp["objId"] && "of card id" && tCardId && "of stack" && quote & tName & quote
+      default
+         return empty
+   end switch
+end hxtParentChunk
+
+-- control.create {parentHandle, type, name?, props?} -> {id, type, handle}
+private function hxtOpControlCreate pId, pParams
+   local tPComp
+   put hxtResolveComp(pParams["parentHandle"]) into tPComp
+   if tPComp["error"] is not empty then return hxtError(pId, tPComp["error"], "could not resolve parent handle")
+   local tReason
+   put hxtSafeToEdit(tPComp, "create") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+
+   local tType
+   put pParams["type"] into tType
+   if tType is not among the items of kCreatableTypes then
+      return hxtError(pId, "badarg", "type must be one of:" && kCreatableTypes)
+   end if
+   local tParent
+   put hxtParentChunk(tPComp) into tParent
+   if tParent is empty then return hxtError(pId, "badarg", "parent must be a card or group")
+
+   -- dynamic type requires `do`; inputs are whitelisted type + numeric ids + validated stack name.
+   -- Capture the new id INSIDE the do (it doesn't reliably propagate out via `it`).
+   put empty into sLastCreatedId
+   do ("create" && tType && "in" && tParent & return & "put the id of it into sLastCreatedId")
+   if the result is not empty then return hxtError(pId, "runtime", "create failed:" && the result)
+   if sLastCreatedId is empty then return hxtError(pId, "runtime", "create produced no object id")
+   local tNewId, tStk, tCardId
+   put sLastCreatedId into tNewId
+   put tPComp["stack"] into tStk
+   put tPComp["cardId"] into tCardId
+   return hxtFinishCreate(pId, tStk, tCardId, tNewId, pParams)
+end hxtOpControlCreate
+
+-- widget.create {parentHandle, kind, name?, props?} -> {id, type, kind, handle}
+private function hxtOpWidgetCreate pId, pParams
+   local tPComp
+   put hxtResolveComp(pParams["parentHandle"]) into tPComp
+   if tPComp["error"] is not empty then return hxtError(pId, tPComp["error"], "could not resolve parent handle")
+   local tReason
+   put hxtSafeToEdit(tPComp, "create") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+
+   local tKind
+   put pParams["kind"] into tKind
+   if tKind is empty or tKind contains quote or tKind contains space or tKind contains return then
+      return hxtError(pId, "badarg", "kind must be a widget module id (e.g. com.livecode.widget.list)")
+   end if
+   local tParent
+   put hxtParentChunk(tPComp) into tParent
+   if tParent is empty then return hxtError(pId, "badarg", "parent must be a card or group")
+
+   put empty into sLastCreatedId
+   do ("create widget as" && quote & tKind & quote && "in" && tParent & return & \
+      "put the id of it into sLastCreatedId")
+   if the result is not empty then return hxtError(pId, "runtime", "create widget failed:" && the result)
+   if sLastCreatedId is empty then return hxtError(pId, "runtime", "create widget produced no object id")
+   local tNewId, tStk, tCardId
+   put sLastCreatedId into tNewId
+   put tPComp["stack"] into tStk
+   put tPComp["cardId"] into tCardId
+   return hxtFinishCreate(pId, tStk, tCardId, tNewId, pParams)
+end hxtOpWidgetCreate
+
+-- Shared create tail: optional name + props, then mint the handle.
+private function hxtFinishCreate pId, pStk, pCardId, pNewId, pParams
+   -- Transactional: if name/props setting fails, delete the just-created object (don't leak it).
+   try
+      if pParams["name"] is not empty then
+         set the name of control id pNewId of card id pCardId of stack pStk to pParams["name"]
+      end if
+      if pParams["props"] is an array then
+         set the properties of control id pNewId of card id pCardId of stack pStk to pParams["props"]
+      end if
+   catch tInitErr
+      try
+         delete control id pNewId of card id pCardId of stack pStk
+      catch tIgnore
+      end try
+      return hxtError(pId, "runtime", "failed to initialize new object:" && tInitErr)
+   end try
+   local tType, tResult
+   put word 1 of the long id of control id pNewId of card id pCardId of stack pStk into tType
+   put pNewId into tResult["id"]
+   put tType into tResult["type"]
+   if tType is "widget" then
+      put the kind of widget id pNewId of card id pCardId of stack pStk into tResult["kind"]
+   end if
+   put hxtObjHandle(pStk, pCardId, tType, pNewId) into tResult["handle"]
+   return hxtOk(pId, tResult)
+end hxtFinishCreate
+
+-- object.delete {handle} -> {deleted:true}
+private function hxtOpDelete pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   local tReason
+   put hxtSafeToEdit(tComp, "delete") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+   local tName, tCardId, tObjId
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   switch tComp["kind"]
+      case "stack"
+         return hxtError(pId, "badarg", "refusing to delete a stack via object.delete")
+      case "card"
+         delete card id tCardId of stack tName
+         break
+      default
+         delete control id tObjId of card id tCardId of stack tName
+   end switch
+   local tResult
+   put true into tResult["deleted"]
+   return hxtOk(pId, tResult)
+end hxtOpDelete
+
+-- object.clone {handle, name?} -> {id, type, handle}
+private function hxtOpClone pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if tComp["kind"] is "stack" or tComp["kind"] is "card" then
+      return hxtError(pId, "badarg", "object.clone supports controls/widgets only")
+   end if
+   local tReason
+   put hxtSafeToEdit(tComp, "create") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+   local tName, tCardId, tObjId
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   clone control id tObjId of card id tCardId of stack tName
+   if the result is not empty then return hxtError(pId, "runtime", "clone failed:" && the result)
+   local tNewId
+   put the id of it into tNewId
+   return hxtFinishCreate(pId, tName, tCardId, tNewId, pParams)
+end hxtOpClone
+
+-- object.setProps {handle, props} -> {ok}. Partial update via `set the properties`.
+private function hxtOpSetProps pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if pParams["props"] is not an array then return hxtError(pId, "badarg", "props must be an object")
+   local tReason
+   put hxtSafeToEdit(tComp, "setProps") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+   local tName, tCardId, tObjId
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   switch tComp["kind"]
+      case "stack"
+         set the properties of stack tName to pParams["props"]
+         break
+      case "card"
+         set the properties of card id tCardId of stack tName to pParams["props"]
+         break
+      default
+         set the properties of control id tObjId of card id tCardId of stack tName to pParams["props"]
+   end switch
+   local tResult
+   put true into tResult["ok"]
+   return hxtOk(pId, tResult)
+end hxtOpSetProps
+
+-- object.setScript {handle, script} -> {ok} | compile error | compiled-library no-op.
+-- Transactional: cache old, set new, surface compile errors (restoring old), and detect the
+-- silent no-op of compiled libraries by reading back.
+private function hxtOpSetScript pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   local tReason
+   put hxtSafeToEdit(tComp, "setScript") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+
+   local tNew, tExpected
+   put pParams["script"] into tNew
+   put tNew into tExpected
+   if tExpected is not empty and the last char of tExpected is not return then
+      put return after tExpected   -- engine appends a trailing newline on set
+   end if
+
+   local tName, tCardId, tObjId, tOld, tErr, tBack
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   switch tComp["kind"]
+      case "stack"
+         put the script of stack tName into tOld
+         set the script of stack tName to tNew
+         put the result into tErr
+         put the script of stack tName into tBack
+         if tErr is not empty then set the script of stack tName to tOld
+         break
+      case "card"
+         put the script of card id tCardId of stack tName into tOld
+         set the script of card id tCardId of stack tName to tNew
+         put the result into tErr
+         put the script of card id tCardId of stack tName into tBack
+         if tErr is not empty then set the script of card id tCardId of stack tName to tOld
+         break
+      default
+         put the script of control id tObjId of card id tCardId of stack tName into tOld
+         set the script of control id tObjId of card id tCardId of stack tName to tNew
+         put the result into tErr
+         put the script of control id tObjId of card id tCardId of stack tName into tBack
+         if tErr is not empty then set the script of control id tObjId of card id tCardId of stack tName to tOld
+   end switch
+
+   if tErr is not empty then return hxtError(pId, "compile", tErr)
+   if tBack is not tExpected then
+      return hxtError(pId, "runtime", "set script had no effect (compiled library or locked object)")
+   end if
+   local tResult
+   put true into tResult["ok"]
+   return hxtOk(pId, tResult)
+end hxtOpSetScript
+
+-- stack.save {handle} -> {file}
+private function hxtOpStackSave pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if tComp["kind"] is not "stack" then return hxtError(pId, "badarg", "stack.save expects a stack handle")
+   local tName
+   put tComp["stack"] into tName
+   if the effective filename of stack tName is empty then
+      return hxtError(pId, "badarg", "stack has never been saved; use stack.saveAs")
+   end if
+   save stack tName
+   if the result is not empty then return hxtError(pId, "runtime", "save failed:" && the result)
+   local tResult
+   put the effective filename of stack tName into tResult["file"]
+   return hxtOk(pId, tResult)
+end hxtOpStackSave
+
+-- stack.saveAs {handle, fileName} -> {file}. The bridge resolves the path (Documents folder).
+private function hxtOpStackSaveAs pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if tComp["kind"] is not "stack" then return hxtError(pId, "badarg", "stack.saveAs expects a stack handle")
+   local tFile
+   put pParams["fileName"] into tFile
+   if tFile is empty or tFile contains "/" or tFile contains "\" or tFile contains ":" \
+      or tFile contains ".." then
+      return hxtError(pId, "badarg", "fileName must be a bare file name (no path separators)")
+   end if
+   if not (tFile ends with ".livecode") and not (tFile ends with ".hyperxtalk") then
+      put tFile & ".livecode" into tFile
+   end if
+   local tPath, tName
+   put tComp["stack"] into tName
+   put specialFolderPath("documents") & "/" & tFile into tPath
+   save stack tName as tPath
+   if the result is not empty then return hxtError(pId, "runtime", "saveAs failed:" && the result)
+   local tResult
+   put tPath into tResult["file"]
+   return hxtOk(pId, tResult)
+end hxtOpStackSaveAs
 
 
 -- ---- control-tree enumeration (number of controls is FLAT, so filter top-level by owner) ----
@@ -621,6 +957,12 @@ private function hxtResolveComp pHandle
       put "badarg" into tComp["error"]
       return tComp
    end if
+   -- Injection guard: cardId/objId are interpolated into chunk expressions (and a `do` on create),
+   -- so a crafted handle must not smuggle xTalk through them. They must be plain integers.
+   if tH["cardId"] is not an integer or tH["objId"] is not an integer then
+      put "badarg" into tComp["error"]
+      return tComp
+   end if
 
    local tName
    put hxtFindOpenStack(tH["stack"]) into tName
@@ -685,14 +1027,17 @@ on __HxtWritten pSocketID
 end __HxtWritten
 
 on socketError pSocketID, pError
+   hxtLog "socketError id=" & pSocketID & " listener=" & sListenPort & " err=" & pError
    hxtCleanupSocket pSocketID
 end socketError
 
 on socketClosed pSocketID
+   hxtLog "socketClosed id=" & pSocketID & " listener=" & sListenPort
    hxtCleanupSocket pSocketID
 end socketClosed
 
 on socketTimeout pSocketID
+   hxtLog "socketTimeout id=" & pSocketID & " listener=" & sListenPort
    hxtCleanupSocket pSocketID
 end socketTimeout
 

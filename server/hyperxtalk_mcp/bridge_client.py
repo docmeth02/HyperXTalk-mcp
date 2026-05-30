@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import uuid
 from pathlib import Path
@@ -72,10 +73,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def find_handshake() -> dict | None:
-    """Return the parsed handshake if a live bridge advertised one, else ``None``.
+def _port_reachable(port: int) -> bool:
+    """Is something actually listening on 127.0.0.1:port right now?"""
+    if port <= 0:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
-    Ignores a stale handshake left behind by a dead process.
+
+def find_handshake() -> dict | None:
+    """Return the parsed handshake if a reachable bridge advertised one, else ``None``.
+
+    Ignores a stale handshake left behind by a dead process OR one whose advertised port is no
+    longer accepting connections (e.g. a transient duplicate instance overwrote it).
     """
     path = handshake_path()
     if not path.is_file():
@@ -87,6 +100,8 @@ def find_handshake() -> dict | None:
     if not isinstance(data, dict):
         return None
     if not _pid_alive(int(data.get("pid", 0) or 0)):
+        return None
+    if not _port_reachable(int(data.get("port", 0) or 0)):
         return None
     return data
 

@@ -90,6 +90,67 @@ def test_safe_to_edit_real_bridge():
 
 
 @_skip
+def test_edit_roundtrip_real_bridge():
+    """Create -> set props/script -> read back -> clone -> delete. Self-cleaning; never saves."""
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=20)
+    stacks = _as_list(c.call("stacks.list").get("stacks"))
+    if not stacks:
+        pytest.skip("no user stacks open in HyperXTalk")
+    card_handle = _as_list(c.call("tree.get", {"handle": stacks[0]["handle"]}).get("cards"))[0][
+        "handle"
+    ]
+
+    created = []
+    try:
+        made = c.call(
+            "control.create",
+            {"parentHandle": card_handle, "type": "button", "name": "MCP Test Button",
+             "props": {"width": 120}},
+        )
+        assert made.get("type") == "button" and made.get("id") and made.get("handle")
+        h = made["handle"]
+        created.append(h)
+
+        props = c.call("object.getProps", {"handle": h})["props"]
+        assert props["name"] == "MCP Test Button"
+        # `the properties` reports geometry via `rect` (L,T,R,B), not a `width` key
+        left, _top, right, _bottom = (int(n) for n in str(props["rect"]).split(","))
+        assert right - left == 120
+
+        script = 'on mouseUp\n   answer "hi from mcp"\nend mouseUp'
+        c.call("object.setScript", {"handle": h, "script": script})
+        assert c.call("object.getScript", {"handle": h})["script"].strip() == script.strip()
+
+        # a syntax error is rejected and the good script is preserved
+        bad = "on mouseUp\n   repeat\nend mouseUp"
+        with pytest.raises(BridgeError) as ce:
+            c.call("object.setScript", {"handle": h, "script": bad})
+        assert ce.value.kind == "compile"
+        assert c.call("object.getScript", {"handle": h})["script"].strip() == script.strip()
+
+        cloned = c.call("object.clone", {"handle": h, "name": "MCP Test Clone"})
+        assert cloned.get("handle")
+        created.append(cloned["handle"])
+        clone_props = c.call("object.getProps", {"handle": cloned["handle"]})["props"]
+        assert clone_props["name"] == "MCP Test Clone"
+    finally:
+        for handle in created:
+            try:
+                c.call("object.delete", {"handle": handle})
+            except BridgeError:
+                pass
+
+    # deleted -> handles are now stale
+    for handle in created:
+        with pytest.raises(BridgeError) as de:
+            c.call("object.getProps", {"handle": handle})
+        assert de.value.kind == "stale_handle"
+
+
+@_skip
 def test_stale_handle_real_bridge():
     """A handle for a stack that isn't open resolves fail-closed to stale_handle."""
     from hyperxtalk_mcp import handles

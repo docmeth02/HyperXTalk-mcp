@@ -127,6 +127,92 @@ def get_script(handle: str) -> dict:
     return {"script": result.get("script", "")}
 
 
+# --- editing tools (phase 4) ---------------------------------------------------------------------
+# All mutations are gated by the bridge's safe-to-edit check; an unsafe state returns
+# {"error": "not_safe_to_edit: <reason>"} (e.g. paused, open_in_editor, stack_cant_modify).
+
+
+def _call(op: str, params: dict) -> dict:
+    try:
+        return _client.call(op, params)
+    except (BridgeUnavailable, BridgeError) as exc:
+        return _err(exc)
+
+
+@mcp.tool
+def create_control(
+    parent_handle: str, control_type: str, name: str = "", props: dict | None = None
+) -> dict:
+    """Create a control on a card or inside a group.
+
+    `parent_handle` is a card or group handle (from get_tree). `control_type` is one of
+    button, field, graphic, image, scrollbar, player, group. Optionally set `name` and `props`
+    (a property→value object). Returns the new control's id, type, and opaque handle.
+    """
+    params: dict = {"parentHandle": parent_handle, "type": control_type}
+    if name:
+        params["name"] = name
+    if props:
+        params["props"] = props
+    return _call("control.create", params)
+
+
+@mcp.tool
+def create_widget(
+    parent_handle: str, kind: str, name: str = "", props: dict | None = None
+) -> dict:
+    """Create a widget of a given `kind` (LCB module id, e.g. com.livecode.widget.list) on a card
+    or inside a group. Returns the new widget's id, type, kind, and handle."""
+    params: dict = {"parentHandle": parent_handle, "kind": kind}
+    if name:
+        params["name"] = name
+    if props:
+        params["props"] = props
+    return _call("widget.create", params)
+
+
+@mcp.tool
+def delete_object(handle: str) -> dict:
+    """Delete a control/widget or a card by `handle`. (Stacks cannot be deleted via this tool.)"""
+    return _call("object.delete", {"handle": handle})
+
+
+@mcp.tool
+def clone_object(handle: str, name: str = "") -> dict:
+    """Clone a control/widget (optionally renaming the copy). Returns the new object's handle."""
+    params: dict = {"handle": handle}
+    if name:
+        params["name"] = name
+    return _call("object.clone", params)
+
+
+@mcp.tool
+def set_properties(handle: str, props: dict) -> dict:
+    """Set a subset of an object's properties (partial update; unknown/read-only keys ignored)."""
+    return _call("object.setProps", {"handle": handle, "props": props})
+
+
+@mcp.tool
+def set_script(handle: str, script: str) -> dict:
+    """Set the xTalk script of an object (transactional + compile-checked).
+
+    On a syntax error the original script is restored and `{"error": "compile: ..."}` is returned.
+    """
+    return _call("object.setScript", {"handle": handle, "script": script})
+
+
+@mcp.tool
+def save_stack(handle: str) -> dict:
+    """Save a stack to its existing file. Use save_stack_as for a never-saved stack."""
+    return _call("stack.save", {"handle": handle})
+
+
+@mcp.tool
+def save_stack_as(handle: str, file_name: str) -> dict:
+    """Save a stack under a new bare file name (no path) in the user's Documents folder."""
+    return _call("stack.saveAs", {"handle": handle, "fileName": file_name})
+
+
 def main() -> None:
     """Run the MCP server over stdio."""
     mcp.run()
