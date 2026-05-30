@@ -414,6 +414,35 @@ def grep_scripts(stack_handle: str, pattern: str, ignore_case: bool = True) -> d
     return {"matches": matches, "scanned": len(targets)}
 
 
+# --- agent ergonomics: invoke + escape hatch (phase 8b) ------------------------------------------
+
+
+@mcp.tool
+def send_message(handle: str, message: str, args: list[str] | None = None) -> dict:
+    """Invoke a handler on an object and return its return value.
+
+    `message` is a single handler name (identifier). Optional `args` are passed as string literals
+    (quotes/newlines are rejected). The code-execution verbs do/value/send/dispatch/call are blocked
+    here — use eval_xtalk for arbitrary code. Returns {"result": <the handler's return value>}.
+    """
+    params: dict = {"handle": handle, "message": message}
+    if args:
+        params["args"] = args
+    return _call("object.send", params)
+
+
+@mcp.tool
+def eval_xtalk(code: str, mode: str = "do") -> dict:
+    """Run arbitrary xTalk (the escape hatch). DISABLED by default.
+
+    `mode` "do" runs `code` as a command and returns `the result`; "value" evaluates `code` as an
+    expression and returns its value. This only works if the user has turned on the "Allow do /
+    value" toggle in the bridge palette Settings tab (otherwise returns an `unauthorized` error).
+    Every call is logged in the palette. Prefer the dedicated tools; use this only as a last resort.
+    """
+    return _call("bridge.eval", {"code": code, "mode": mode})
+
+
 def main() -> None:
     """Run the MCP server over stdio."""
     mcp.run()

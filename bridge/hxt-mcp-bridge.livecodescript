@@ -529,6 +529,10 @@ private function hxtDispatch pId, pOperation, pParams
          return hxtOpExtensionsList(pId)
       case "run.setMode"
          return hxtOpRunSetMode(pId, pParams)
+      case "object.send"
+         return hxtOpSend(pId, pParams)
+      case "bridge.eval"
+         return hxtOpEval(pId, pParams)
       default
          return hxtError(pId, "notfound", "unknown op:" && pOperation)
    end switch
@@ -1206,6 +1210,111 @@ private function hxtOpRunSetMode pId, pParams
    put the tool into tResult["tool"]
    return hxtOk(pId, tResult)
 end hxtOpRunSetMode
+
+-- object.send {handle, message, args?} -> {result}. Invokes a named handler on an object and
+-- returns its return value (via `the result`). Honours pause. message must be a bare identifier;
+-- code-execution verbs (do/value/send/dispatch/call) are blocked here (use bridge.eval for those);
+-- args are quoted string literals with quotes/newlines rejected, so there is no injection.
+private function hxtOpSend pId, pParams
+   if sPaused is true then return hxtError(pId, "not_safe_to_edit", "paused")
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   local tMessage
+   put pParams["message"] into tMessage
+   if not matchText(tMessage, "^[A-Za-z_][A-Za-z0-9_]*$") then
+      return hxtError(pId, "badarg", "message must be a single handler name (identifier)")
+   end if
+   if toLower(tMessage) is among the items of "do,value,send,dispatch,call" then
+      return hxtError(pId, "badarg", "that verb is blocked here; use the bridge.eval escape hatch")
+   end if
+   local tName, tCardId, tObjId, tErr, tObjScript
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   -- Only invoke a handler DEFINED IN THIS OBJECT'S OWN SCRIPT. This closes the backscript/library
+   -- escape (revExecuteScript et al. are never in a user object's script), so object.send cannot be
+   -- a way around the gated do/value escape hatch.
+   switch tComp["kind"]
+      case "stack"
+         put the script of stack tName into tObjScript
+         break
+      case "card"
+         put the script of card id tCardId of stack tName into tObjScript
+         break
+      default
+         put the script of control id tObjId of card id tCardId of stack tName into tObjScript
+   end switch
+   if not matchText(tObjScript, "(?im)^[ \t]*(on|command)[ \t]+" & tMessage & "\b") then
+      return hxtError(pId, "notfound", "no on/command handler named" && tMessage && "in that object's script")
+   end if
+   local tCall, tArgs, tArg, tParts, i, nArgs
+   put tMessage into tCall
+   if pParams["args"] is an array then
+      put pParams["args"] into tArgs
+      put the number of elements of tArgs into nArgs
+      repeat with i = 1 to nArgs
+         put tArgs[i] into tArg
+         if tArg contains quote or tArg contains return or tArg contains linefeed then
+            return hxtError(pId, "badarg", "args must not contain quotes or newlines")
+         end if
+         if i > 1 then put comma after tParts
+         put quote & tArg & quote after tParts
+      end repeat
+      if tParts is not empty then put tCall && tParts into tCall
+   end if
+   -- typed-chunk send (tCall is a value, not interpolated into a chunk) -> no injection surface
+   try
+      switch tComp["kind"]
+         case "stack"
+            send tCall to stack tName
+            break
+         case "card"
+            send tCall to card id tCardId of stack tName
+            break
+         default
+            send tCall to control id tObjId of card id tCardId of stack tName
+      end switch
+   catch tErr
+      return hxtError(pId, "runtime", "send failed:" && tErr)
+   end try
+   local tResult
+   put the result into tResult["result"]
+   return hxtOk(pId, tResult)
+end hxtOpSend
+
+-- bridge.eval {code, mode?} -> {result}. The escape hatch: runs arbitrary xTalk via `do` (mode
+-- "do", returns `the result`) or evaluates an expression via `value()` (mode "value"). OFF unless
+-- the palette Settings "Allow do / value" toggle is on (sAllowDo). Every call is logged.
+private function hxtOpEval pId, pParams
+   if sPaused is true then return hxtError(pId, "not_safe_to_edit", "paused")
+   if sAllowDo is not true then
+      return hxtError(pId, "unauthorized", "do/value escape hatch is off; enable it in the bridge palette Settings")
+   end if
+   local tCode, tMode, tRet, tErr, tLogLine
+   put pParams["code"] into tCode
+   put pParams["mode"] into tMode
+   if tMode is empty then put "do" into tMode
+   -- log the WHOLE code (collapsed to one line, truncated) so the payload can't hide on line 2+
+   put tCode into tLogLine
+   replace return with space in tLogLine
+   replace linefeed with space in tLogLine
+   if the length of tLogLine > 200 then put char 1 to 200 of tLogLine & " ..." into tLogLine
+   hxtUILog "ESCAPE-HATCH (" & tMode & "): " & tLogLine
+   try
+      if tMode is "value" then
+         put value(tCode) into tRet
+      else
+         do tCode
+         put the result into tRet
+      end if
+   catch tErr
+      return hxtError(pId, "runtime", "escape-hatch error:" && tErr)
+   end try
+   local tResult
+   put tRet into tResult["result"]
+   return hxtOk(pId, tResult)
+end hxtOpEval
 
 
 -- ---- control-tree enumeration (number of controls is FLAT, so filter top-level by owner) ----

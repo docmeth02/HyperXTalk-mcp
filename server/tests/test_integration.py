@@ -373,6 +373,48 @@ def test_handler_edit_roundtrip_real_bridge():
 
 
 @_skip
+def test_send_message_and_escape_hatch_real_bridge():
+    """Phase 8b: object.send invokes a handler & returns its value; eval off by default."""
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=20)
+    st = c.call("stack.create", {"name": "MCP Send Test"})
+    try:
+        card = _as_list(c.call("tree.get", {"handle": st["handle"]}).get("cards"))[0]["handle"]
+        btn = c.call("control.create", {"parentHandle": card, "type": "button", "name": "b"})[
+            "handle"
+        ]
+        script = (
+            # message dispatch reaches `on`/`command` handlers (not `function`s)
+            'command getValue\n   return "hi-handler"\nend getValue\n\n'
+            'command echoArg pX\n   return "got:" & pX\nend echoArg'
+        )
+        c.call("object.setScript", {"handle": btn, "script": script})
+
+        assert (
+            c.call("object.send", {"handle": btn, "message": "getValue"})["result"] == "hi-handler"
+        )
+        with_arg = c.call("object.send", {"handle": btn, "message": "echoArg", "args": ["world"]})
+        assert with_arg["result"] == "got:world"
+
+        # code-execution verbs are blocked in object.send
+        with pytest.raises(BridgeError) as exc:
+            c.call("object.send", {"handle": btn, "message": "do", "args": ["beep"]})
+        assert exc.value.kind == "badarg"
+
+        # escape hatch is OFF by default -> unauthorized (until the user enables the palette toggle)
+        with pytest.raises(BridgeError) as ex2:
+            c.call("bridge.eval", {"code": "put 1 into tX", "mode": "do"})
+        assert ex2.value.kind == "unauthorized"
+    finally:
+        try:
+            c.call("stack.delete", {"handle": st["handle"]})
+        except BridgeError:
+            pass
+
+
+@_skip
 def test_concurrent_request_gets_busy():
     """While one request holds the bridge busy (via __busytest), a second must get 409 busy."""
     import threading

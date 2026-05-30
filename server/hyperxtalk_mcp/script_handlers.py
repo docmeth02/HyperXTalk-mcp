@@ -15,7 +15,14 @@ _START_RE = re.compile(
     r"^[ \t]*(on|command|function|getprop|setprop|before|after)[ \t]+([A-Za-z_][\w]*)",
     re.IGNORECASE,
 )
-_END_RE = re.compile(r"^[ \t]*end[ \t]+([A-Za-z_][\w]*)[ \t]*$", re.IGNORECASE)
+# no end-anchor: \w* greedily captures the whole identifier, so trailing whitespace/comments
+# (e.g. `end mouseUp -- done`) and stray CR don't prevent the match.
+_END_RE = re.compile(r"^[ \t]*end[ \t]+([A-Za-z_]\w*)", re.IGNORECASE)
+
+
+def _normalize(script: str) -> str:
+    """Collapse CRLF/CR to LF so line splitting and offsets are consistent (engine is LF-native)."""
+    return script.replace("\r\n", "\n").replace("\r", "\n")
 
 
 @dataclass
@@ -32,7 +39,7 @@ class Handler:
 
 def parse_handlers(script: str) -> list[Handler]:
     """Return the top-level handlers in ``script`` (nested control `end`s are ignored by name)."""
-    lines = script.split("\n")
+    lines = _normalize(script).split("\n")
     handlers: list[Handler] = []
     i = 0
     while i < len(lines):
@@ -70,7 +77,8 @@ def find_handler(script: str, name: str) -> Handler | None:
 
 def replace_or_append_handler(script: str, name: str, new_text: str) -> str:
     """Return ``script`` with handler ``name`` replaced by ``new_text`` (appended if absent)."""
-    new_text = new_text.rstrip("\n")
+    script = _normalize(script)
+    new_text = _normalize(new_text).rstrip("\n")
     existing = find_handler(script, name)
     if existing is None:
         sep = "" if script == "" else ("\n" if script.endswith("\n") else "\n\n")
