@@ -515,6 +515,20 @@ private function hxtDispatch pId, pOperation, pParams
          return hxtOpStackSave(pId, pParams)
       case "stack.saveAs"
          return hxtOpStackSaveAs(pId, pParams)
+      case "stack.create"
+         return hxtOpStackCreate(pId, pParams)
+      case "stack.delete"
+         return hxtOpStackDelete(pId, pParams)
+      case "card.create"
+         return hxtOpCardCreate(pId, pParams)
+      case "object.snapshot"
+         return hxtOpSnapshot(pId, pParams)
+      case "env.get"
+         return hxtOpEnvGet(pId)
+      case "extensions.list"
+         return hxtOpExtensionsList(pId)
+      case "run.setMode"
+         return hxtOpRunSetMode(pId, pParams)
       default
          return hxtError(pId, "notfound", "unknown op:" && pOperation)
    end switch
@@ -995,6 +1009,203 @@ private function hxtOpStackSaveAs pId, pParams
    put tPath into tResult["file"]
    return hxtOk(pId, tResult)
 end hxtOpStackSaveAs
+
+
+-- ============================================================ visual & settings (phase 7)
+
+-- stack.create {name?} -> {handle, name}. Mints a NEW top-level stack; honours the pause switch.
+-- Diffs the open-stack set so we learn the engine-assigned name (it may disambiguate a duplicate).
+private function hxtOpStackCreate pId, pParams
+   if sPaused is true then return hxtError(pId, "not_safe_to_edit", "paused")
+   local tName
+   put pParams["name"] into tName
+   -- name is interpolated into a `do`; block quote (string break) AND both line endings (statement
+   -- break: linefeed=LF as well as return=CR) plus path separators -> no injection is possible.
+   if tName contains quote or tName contains return or tName contains linefeed or tName contains "/" or tName contains "\" then
+      return hxtError(pId, "badarg", "stack name must not contain quotes, slashes, or newlines")
+   end if
+   local tBefore, tAfter, tNew, tS, tOldDefault, tCreateErr
+   put the defaultStack into tOldDefault
+   put the openStacks into tBefore
+   if tName is empty then
+      create stack
+   else
+      do ("create stack " & quote & tName & quote)
+   end if
+   put the result into tCreateErr   -- capture before set-defaultStack clears `the result`
+   put the openStacks into tAfter
+   repeat for each line tS in tAfter
+      if tS is not among the lines of tBefore then
+         put tS into tNew
+         exit repeat
+      end if
+   end repeat
+   set the defaultStack to tOldDefault   -- creating a stack repoints defaultStack; restore it
+   if tCreateErr is not empty then return hxtError(pId, "runtime", "create stack failed:" && tCreateErr)
+   if tNew is empty then return hxtError(pId, "runtime", "stack created but not found among open stacks")
+   local tResult
+   put hxtStackHandle(tNew) into tResult["handle"]
+   put tNew into tResult["name"]
+   return hxtOk(pId, tResult)
+end hxtOpStackCreate
+
+-- stack.delete {handle} -> {}. Discards an UNSAVED scratch stack from memory. Refuses any stack
+-- with a file (never nukes saved work) and honours the pause switch.
+private function hxtOpStackDelete pId, pParams
+   if sPaused is true then return hxtError(pId, "not_safe_to_edit", "paused")
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if tComp["kind"] is not "stack" then return hxtError(pId, "badarg", "stack.delete expects a stack handle")
+   local tName
+   put tComp["stack"] into tName
+   if tName is the short name of me or tName is "hxt-mcp-bridge" then
+      return hxtError(pId, "badarg", "refusing to delete the bridge's own stack")
+   end if
+   if the effective filename of stack tName is not empty then
+      return hxtError(pId, "badarg", "refusing to delete a saved stack (only unsaved scratch stacks)")
+   end if
+   local tOldDefault, tDelErr
+   put the defaultStack into tOldDefault
+   set the destroyStack of stack tName to true   -- allow removal
+   set the dirty of stack tName to false          -- no save-confirmation prompt
+   delete stack tName
+   put the result into tDelErr
+   -- restore defaultStack unless it was the stack just deleted (then fall back to the bridge)
+   if there is a stack tOldDefault then
+      set the defaultStack to tOldDefault
+   else
+      set the defaultStack to the short name of me
+   end if
+   if tDelErr is not empty then return hxtError(pId, "runtime", "delete stack failed:" && tDelErr)
+   local tResult
+   put true into tResult["deleted"]
+   return hxtOk(pId, tResult)
+end hxtOpStackDelete
+
+-- card.create {stackHandle} -> {id, handle}. Appends a card to an open stack (gated by safeToEdit).
+private function hxtOpCardCreate pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["stackHandle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve stack handle")
+   if tComp["kind"] is not "stack" then return hxtError(pId, "badarg", "card.create expects a stack handle")
+   local tReason
+   put hxtSafeToEdit(tComp, "create") into tReason
+   if tReason is not empty then return hxtError(pId, "not_safe_to_edit", tReason)
+   local tName, tOldDefault, tNewId, tCreateErr, tOk
+   put tComp["stack"] into tName
+   put the defaultStack into tOldDefault
+   put false into tOk
+   try
+      set the defaultStack to tName
+      create card
+      put the result into tCreateErr
+      if tCreateErr is empty then
+         put the id of this card into tNewId   -- the new card becomes current
+         put true into tOk
+      end if
+   catch tCreateErr
+   end try
+   set the defaultStack to tOldDefault   -- always restore, even if create card threw
+   if tOk is false then return hxtError(pId, "runtime", "create card failed:" && tCreateErr)
+   local tResult
+   put hxtObjHandle(tName, tNewId, "card", tNewId) into tResult["handle"]
+   put tNewId into tResult["id"]
+   return hxtOk(pId, tResult)
+end hxtOpCardCreate
+
+-- object.snapshot {handle} -> {png(base64), kind, width, height, scale}. Card/control/group only
+-- (export snapshot returns null for a stack, object.cpp:3072). Object refs use typed chunk vars
+-- (no `do`), so there is no string-injection surface.
+private function hxtOpSnapshot pId, pParams
+   local tComp
+   put hxtResolveComp(pParams["handle"]) into tComp
+   if tComp["error"] is not empty then return hxtError(pId, tComp["error"], "could not resolve handle")
+   if tComp["kind"] is "stack" then
+      return hxtError(pId, "badarg", "cannot snapshot a stack; snapshot a card, group, or control")
+   end if
+   local tName, tCardId, tObjId, tData, tRect, tErr
+   put tComp["stack"] into tName
+   put tComp["cardId"] into tCardId
+   put tComp["objId"] into tObjId
+   try
+      if tComp["kind"] is "card" then
+         export snapshot from card id tCardId of stack tName to tData as PNG
+         put the rect of card id tCardId of stack tName into tRect
+      else
+         export snapshot from control id tObjId of card id tCardId of stack tName to tData as PNG
+         put the rect of control id tObjId of card id tCardId of stack tName into tRect
+      end if
+   catch tErr
+      return hxtError(pId, "runtime", "snapshot failed:" && tErr)
+   end try
+   if tData is empty then return hxtError(pId, "runtime", "snapshot produced no image")
+   local tB64
+   put base64Encode(tData) into tB64
+   replace return with empty in tB64
+   replace linefeed with empty in tB64
+   local tResult, tScale
+   put tB64 into tResult["png"]
+   put tComp["kind"] into tResult["kind"]
+   put (item 3 of tRect - item 1 of tRect) into tResult["width"]
+   put (item 4 of tRect - item 2 of tRect) into tResult["height"]
+   put 1 into tScale
+   try
+      put the systemPixelScale into tScale   -- device scale; PNG pixels = width*scale on HiDPI
+   catch tErr
+   end try
+   if tScale is not a number then put 1 into tScale
+   put tScale into tResult["scale"]
+   return hxtOk(pId, tResult)
+end hxtOpSnapshot
+
+-- env.get -> read-only engine/IDE environment: version, platform, system, processor, tool, scale.
+private function hxtOpEnvGet pId
+   local tResult, tScale, tErr
+   put the version into tResult["version"]
+   put the platform into tResult["platform"]
+   put the systemVersion into tResult["systemVersion"]
+   put the processor into tResult["processor"]
+   put the screenRect into tResult["screenRect"]
+   put the tool into tResult["tool"]
+   put 1 into tScale
+   try
+      put the systemPixelScale into tScale
+   catch tErr
+   end try
+   if tScale is not a number then put 1 into tScale
+   put tScale into tResult["pixelScale"]
+   return hxtOk(pId, tResult)
+end hxtOpEnvGet
+
+-- extensions.list -> {extensions: [...]}. The runtime-loaded extension module ids.
+private function hxtOpExtensionsList pId
+   local tResult, tList, tExtId, n
+   put 0 into n
+   repeat for each line tExtId in the loadedExtensions
+      add 1 to n
+      put tExtId into tList[n]
+   end repeat
+   put tList into tResult["extensions"]
+   return hxtOk(pId, tResult)
+end hxtOpExtensionsList
+
+-- run.setMode {mode:"run"|"edit"} -> {mode, tool}. run=browse tool, edit=pointer tool (IDE-global).
+private function hxtOpRunSetMode pId, pParams
+   local tMode
+   put pParams["mode"] into tMode
+   if tMode is "run" then
+      set the tool to "browse tool"
+   else if tMode is "edit" then
+      set the tool to "pointer tool"
+   else
+      return hxtError(pId, "badarg", "mode must be 'run' or 'edit'")
+   end if
+   local tResult
+   put tMode into tResult["mode"]
+   put the tool into tResult["tool"]
+   return hxtOk(pId, tResult)
+end hxtOpRunSetMode
 
 
 -- ---- control-tree enumeration (number of controls is FLAT, so filter top-level by owner) ----

@@ -158,9 +158,7 @@ def create_control(
 
 
 @mcp.tool
-def create_widget(
-    parent_handle: str, kind: str, name: str = "", props: dict | None = None
-) -> dict:
+def create_widget(parent_handle: str, kind: str, name: str = "", props: dict | None = None) -> dict:
     """Create a widget of a given `kind` (LCB module id, e.g. com.livecode.widget.list) on a card
     or inside a group. Returns the new widget's id, type, kind, and handle."""
     params: dict = {"parentHandle": parent_handle, "kind": kind}
@@ -211,6 +209,72 @@ def save_stack(handle: str) -> dict:
 def save_stack_as(handle: str, file_name: str) -> dict:
     """Save a stack under a new bare file name (no path) in the user's Documents folder."""
     return _call("stack.saveAs", {"handle": handle, "fileName": file_name})
+
+
+# --- visual & settings tools (phase 7) -----------------------------------------------------------
+
+
+@mcp.tool
+def create_stack(name: str = "") -> dict:
+    """Create a new, empty top-level stack and open it. Returns its `handle` and `name`.
+
+    `name` is optional; if omitted the engine auto-names it (e.g. "Untitled 1"). The returned
+    `name` is the engine-assigned one (it may differ from `name` if that name was already taken).
+    Use the handle with create_card / create_control to populate it.
+    """
+    return _call("stack.create", {"name": name} if name else {})
+
+
+@mcp.tool
+def delete_stack(handle: str) -> dict:
+    """Discard an UNSAVED scratch stack from memory.
+
+    Refuses any stack that has a file on disk (it never deletes saved work) — use this to clean up
+    stacks created with create_stack that you don't want to keep.
+    """
+    return _call("stack.delete", {"handle": handle})
+
+
+@mcp.tool
+def create_card(stack_handle: str) -> dict:
+    """Append a new card to a stack (from list_stacks). Returns the new card's id and handle."""
+    return _call("card.create", {"stackHandle": stack_handle})
+
+
+@mcp.tool
+def snapshot(handle: str) -> dict:
+    """Render a card, group, or control to a PNG image (stacks are not supported).
+
+    Returns `png` (base64-encoded PNG, no line breaks), `kind`, logical `width`/`height`, and the
+    device `scale` (on a HiDPI display the PNG's pixel dimensions are width*scale by height*scale).
+    """
+    return _call("object.snapshot", {"handle": handle})
+
+
+@mcp.tool
+def get_environment() -> dict:
+    """Read the engine/IDE environment: version, platform, systemVersion, processor, screenRect,
+    the current `tool` (browse=run / pointer=edit), and the device pixelScale."""
+    return _call("env.get", {})
+
+
+@mcp.tool
+def list_extensions() -> dict:
+    """List the runtime-loaded extension module ids (widgets, libraries, modules)."""
+    result = _call("extensions.list", {})
+    if "error" in result:
+        return result
+    return {"extensions": _as_list(result.get("extensions"))}
+
+
+@mcp.tool
+def set_run_mode(mode: str) -> dict:
+    """Switch the IDE between run and edit mode (`mode` is "run" or "edit").
+
+    "run" selects the browse tool (clicking activates controls); "edit" selects the pointer tool
+    (clicking selects/moves controls). This is an IDE-global setting, not per-stack.
+    """
+    return _call("run.setMode", {"mode": mode})
 
 
 def main() -> None:

@@ -223,6 +223,120 @@ def test_stale_handle_real_bridge():
 
 
 @_skip
+def test_create_stack_card_delete_real_bridge():
+    """Phase 7: create a scratch stack -> add a card -> verify -> delete card -> delete stack."""
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=20)
+    made = c.call("stack.create", {"name": "MCP Scratch Stack"})
+    assert made.get("handle") and made.get("name")
+    stack_handle = made["handle"]
+    try:
+        cards = _as_list(c.call("tree.get", {"handle": stack_handle}).get("cards"))
+        assert len(cards) == 1  # a fresh stack has exactly one card
+
+        new_card = c.call("card.create", {"stackHandle": stack_handle})
+        assert new_card.get("id") and new_card.get("handle")
+        cards2 = _as_list(c.call("tree.get", {"handle": stack_handle}).get("cards"))
+        assert len(cards2) == 2
+
+        # the new card handle resolves and is a card
+        assert c.call("object.getProps", {"handle": new_card["handle"]})["props"]["type"] == "card"
+    finally:
+        # unsaved scratch stack -> deletable; this also removes its cards
+        try:
+            c.call("stack.delete", {"handle": stack_handle})
+        except BridgeError:
+            pass
+    # gone -> stale
+    with pytest.raises(BridgeError) as exc:
+        c.call("tree.get", {"handle": stack_handle})
+    assert exc.value.kind == "stale_handle"
+
+
+@_skip
+def test_create_stack_rejects_injection_real_bridge():
+    """stack.create interpolates the name into a `do`; newlines/quotes/slashes are rejected."""
+    from hyperxtalk_mcp.errors import BridgeError
+
+    c = BridgeClient(timeout=15)
+    for evil in ["x\ndelete stack", 'x"\ndelete stack', "x/y"]:
+        with pytest.raises(BridgeError) as exc:
+            c.call("stack.create", {"name": evil})
+        assert exc.value.kind == "badarg"
+
+
+@_skip
+def test_stack_delete_refuses_saved_stack_real_bridge():
+    """stack.delete must refuse a stack that has a file on disk (never nukes saved work)."""
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=20)
+    saved = [s for s in _as_list(c.call("stacks.list").get("stacks")) if s.get("file")]
+    if not saved:
+        pytest.skip("no saved (on-disk) stack open to test the refusal")
+    with pytest.raises(BridgeError) as exc:
+        c.call("stack.delete", {"handle": saved[0]["handle"]})
+    assert exc.value.kind == "badarg"
+
+
+@_skip
+def test_snapshot_real_bridge():
+    """Phase 7: snapshot a control to a base64 PNG; stacks are refused."""
+    import base64
+
+    from hyperxtalk_mcp.errors import BridgeError
+    from hyperxtalk_mcp.server import _as_list, _normalize_controls
+
+    c = BridgeClient(timeout=20)
+    stacks = _as_list(c.call("stacks.list").get("stacks"))
+    if not stacks:
+        pytest.skip("no user stacks open in HyperXTalk")
+    cards = _as_list(c.call("tree.get", {"handle": stacks[0]["handle"]}).get("cards"))
+    ctrls = _normalize_controls(cards[0].get("controls"))
+    if not ctrls:
+        pytest.skip("first card has no controls to snapshot")
+
+    snap = c.call("object.snapshot", {"handle": ctrls[0]["handle"]})
+    assert snap.get("png") and "\n" not in snap["png"]
+    assert base64.b64decode(snap["png"])[:8] == b"\x89PNG\r\n\x1a\n"  # PNG magic
+    assert int(snap["width"]) > 0 and int(snap["height"]) > 0
+
+    # a stack handle is refused
+    with pytest.raises(BridgeError) as exc:
+        c.call("object.snapshot", {"handle": stacks[0]["handle"]})
+    assert exc.value.kind == "badarg"
+
+
+@_skip
+def test_environment_and_extensions_real_bridge():
+    """Phase 7: env.get returns engine info; extensions.list returns a list."""
+    from hyperxtalk_mcp.server import _as_list
+
+    c = BridgeClient(timeout=15)
+    env = c.call("env.get", {})
+    assert env.get("version") and env.get("platform")
+    assert "tool" in env and "pixelScale" in env
+
+    exts = _as_list(c.call("extensions.list", {}).get("extensions"))
+    assert isinstance(exts, list)  # may be empty, but must be a list
+
+
+@_skip
+def test_run_set_mode_real_bridge():
+    """Phase 7: run.setMode toggles the IDE tool; leaves it in edit mode afterward."""
+    c = BridgeClient(timeout=15)
+    try:
+        run = c.call("run.setMode", {"mode": "run"})
+        assert "browse" in run["tool"]
+    finally:
+        edit = c.call("run.setMode", {"mode": "edit"})  # restore authoring mode
+        assert "pointer" in edit["tool"]
+
+
+@_skip
 def test_concurrent_request_gets_busy():
     """While one request holds the bridge busy (via __busytest), a second must get 409 busy."""
     import threading
