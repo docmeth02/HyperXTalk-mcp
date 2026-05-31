@@ -5,9 +5,11 @@ An [MCP](https://modelcontextprotocol.io) server that lets AI agents (Claude Cod
 stacks / cards / controls / widgets, read & edit xTalk script (compile-checked), create / delete /
 modify controls and widgets, snapshot cards, and manage settings.
 
-> **Status:** working and tested on macOS — discovery, editing, creation, snapshots, the language
-> dictionary, and handler-level script ops are all implemented (28 tools, integration-tested against
-> a live IDE). Windows/Linux verification is pending (the code is OS-agnostic by design).
+> **Status:** working and tested on **macOS and Linux** — discovery, editing, creation, snapshots,
+> the language dictionary, and handler-level script ops are all implemented (28 tools, integration-tested
+> against a live IDE). On Linux (x86_64, GTK3) the bridge plugin loads, binds its loopback socket, writes
+> the handshake at the XDG path, and serves RPC end-to-end. Windows verification is still pending (the
+> code is OS-agnostic by design).
 
 ## Capabilities
 
@@ -68,19 +70,35 @@ answer the result
 ```
 
 This installs `hxt-mcp-bridge.livecode` into the user Plugins folder
-(`revEnvironmentUserPluginsPath()`) **and starts it immediately**. A successful run shows
-`installed to …; bridge started as a palette`.
+(`revEnvironmentUserPluginsPath()`) and shows `installed to …; bridge started as a palette`.
+
+The build/install commands are **identical on every OS** — all paths are resolved engine-side, so the
+same block installs the plugin on macOS, Linux, and Windows. The user Plugins folder it installs into
+is `revEnvironmentUserPluginsPath()` (e.g. `~/hyperxtalk_customization/Plugins/` on Linux).
+
+> **Linux caveat — start the bridge from the Plugins menu after building.** On macOS the build also
+> starts the bridge immediately. On Linux the build installs the plugin correctly but the palette opens
+> **stopped** (`palette stack` doesn't fire `openStack → hxtBridgeStart` for a just-built in-memory
+> stack on the GTK engine). Just open it once from **Development ▸ Plugins ▸ hxt-mcp-bridge** — a fresh
+> open fires `openStack` and the bridge starts serving. Every subsequent session uses that same
+> menu-launch, so this only affects the very first build.
 
 For subsequent sessions, just launch it from **Development ▸ Plugins ▸ hxt-mcp-bridge** (there is no
 auto-start). On launch it binds a loopback ephemeral port and writes a handshake file to the per-user
-data folder (`~/Library/Application Support/HyperXTalk/mcp-bridge.json` on macOS); the server
-discovers it there.
+data folder, where the server discovers it. The folder matches `platformdirs.user_data_dir("HyperXTalk")`
+on the Python side:
 
-Useful message-box checks:
+| Platform | Handshake file |
+|----------|----------------|
+| macOS    | `~/Library/Application Support/HyperXTalk/mcp-bridge.json` |
+| Linux    | `~/.local/share/HyperXTalk/mcp-bridge.json` (or `$XDG_DATA_HOME/HyperXTalk/…`) |
+| Windows  | `%APPDATA%\HyperXTalk\mcp-bridge.json` |
+
+Useful message-box checks (`hxtBridgeStatus` is OS-agnostic; the second line shows the Linux path):
 
 ```
 put value("hxtBridgeStatus()", stack "hxt-mcp-bridge")
-put url ("file:" & specialFolderPath("home") & "/Library/Application Support/HyperXTalk/mcp-bridge.json")
+put url ("file:" & specialFolderPath("home") & "/.local/share/HyperXTalk/mcp-bridge.json")
 ```
 
 To stop the bridge: `send "hxtBridgeStop" to stack "hxt-mcp-bridge"`. It also stops when you close
@@ -94,7 +112,7 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -e .              # add '.[dev]' for ruff + pytest
 ```
 
-### 3. Register it with Claude Code
+### 3. Register it with your MCP client
 
 From the `server/` directory (so `$(pwd)` resolves to absolute paths):
 
@@ -107,6 +125,28 @@ project. Equivalent documented long form:
 
 ```sh
 claude mcp add hyperxtalk --scope user -- "$(pwd)/.venv/bin/python" "$(pwd)/mcp_server.py"
+```
+
+**OpenClaude** uses the same CLI surface — just swap the binary:
+
+```sh
+openclaude mcp add hyperxtalk --scope user -- "$(pwd)/.venv/bin/python" "$(pwd)/mcp_server.py"
+```
+
+**opencode** is configured by file, not a CLI command. Add the server to
+`~/.config/opencode/opencode.jsonc` (replace `<repo>` with your checkout path):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "hyperxtalk-mcp": {
+      "type": "local",
+      "command": ["<repo>/server/.venv/bin/python", "<repo>/server/mcp_server.py"],
+      "enabled": true
+    }
+  }
+}
 ```
 
 The `search_dictionary` / `lookup_dictionary` tools auto-find the engine's docs in
@@ -151,7 +191,9 @@ server/   hyperxtalk_mcp/                  FastMCP server, bridge client, handle
   file is written owner-only. It can run arbitrary code in your live IDE session — treat it like a
   localhost dev tool.
 - **Cross-platform by design.** All OS-specific paths are resolved engine-side; the Python side stays
-  OS-agnostic. Verified on macOS; Linux/Windows verification in progress.
+  OS-agnostic. Verified on macOS and Linux (x86_64, GTK3); Windows verification in progress. No
+  platform-specific code was needed for Linux — the bridge's existing per-OS path handling already
+  resolves the XDG data dir.
 - **Large payloads are slow** pending two upstream HyperXTalk fixes — O(n²) socket read
   ([#295](https://github.com/emily-elizabeth/HyperXTalk/issues/295)) and `JsonImport`
   ([#296](https://github.com/emily-elizabeth/HyperXTalk/issues/296)). Typical script payloads are
